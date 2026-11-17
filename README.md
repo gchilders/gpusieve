@@ -15,7 +15,7 @@ finds the same relations as las.
 
 ## Requirements
 
-- An NVIDIA GPU of compute capability 7.0 or later. GPUs with less memory sieve each special-q in more
+- An NVIDIA GPU (tested on compute capability 7.5 and 8.9; the BOINC build includes 5.0 to 12.0). GPUs with less memory sieve each special-q in more
   passes (see [GPU memory](#gpu-memory)).
 - Linux, the CUDA Toolkit, GCC with OpenMP, and make.
 - NFS_factory from the fork linked above, which has `format: keys` and reads `.ab` files from standard input.
@@ -23,8 +23,8 @@ finds the same relations as las.
 ## Build
 
 ```
-make            gpusieve, absort, absplit and ab2keys
-make tools      only absort, absplit and ab2keys (no CUDA needed)
+make            gpusieve, absort, absplit, ab2keys and gsc2ab
+make tools      only absort, absplit, ab2keys and gsc2ab (no CUDA needed)
 ```
 
 | Setting | Meaning |
@@ -202,8 +202,14 @@ counts as a large prime there. Then use a lim of at least the largest special-q 
 | `-threads N` | host threads for the factor base and the special-q roots | 16 |
 | `-progress S` | a progress line every S seconds, 0 for none | 60 |
 | `-v` | timings of each special-q | |
+| `-compact` | write the survivors as a compact `.gsc` file, about 5 times smaller than `.ab` (see [Compact output](#compact-output)) | |
+| `-ckpt FILE` | write a checkpoint to FILE (every `-ckpt-interval` seconds, default 60) | |
+| `-resume` | continue from the checkpoint of an interrupted run with the same poly file and parameters | |
+| `-device N` | the CUDA device (under BOINC the client's assignment wins) | 0 |
 
-Tuning options, rarely needed: `-tiny P` (primes below P are sieved by all threads of a region, default 64),
+Tuning options, rarely needed: `-tiny P` (primes below P are sieved by all threads of a region, default 64), `-med M`
+(primes from P to M are sieved by one warp each, default 1024), `-line L` (primes from I to L, at most 2^20, are
+sieved row by row instead of through the buckets; default 2^17 for I up to 16, 0 for larger I),
 `-lanes 2` (fill the buckets of the next special-q while the rows of this one are sieved), `-bblocks N` and
 `-rblocks N` (persistent grids for the two kernels), `-twopass` (another bucket kernel), and `-dumpfb FILE` (write the
 factor base and stop).
@@ -234,6 +240,58 @@ Besides one pass' buckets, the GPU holds the factor base (about 30 bytes per ent
 side, 0.8 GB at lim `2^29` on a side of degree 7) and two output buffers (32 MB per `-maxout` unit, 512 MB by default).
 At startup gpusieve prints the number of passes and the memory it needs, and stops if the GPU does not have it.
 
+## Compact output
+
+With `-compact` gpusieve writes a `.gsc` file instead of an `.ab` file: per special-q its root and lattice basis, then
+the survivors as sorted lattice positions, coded as gaps with a Golomb-Rice code chosen per special-q, and a CRC-32
+(format in `gsc.h`). That takes about 20 bits per pair (19.5 at I = 16 on a rational side, 17.4 at I = 15 on a degree-7
+side) against 96 in an `.ab` file, for uploads from BOINC volunteers. `gsc2ab` turns `.gsc` files back into the very
+pairs of the `.ab` file, with no poly file needed:
+
+```
+gsc2ab -o part.ab part1.gsc part2.gsc ...
+gsc2ab -o - part.gsc | NFS_factory_gpu check.poly - part.txt
+gsc2ab -info part.gsc        special-q blocks, first and last special-q, pairs, bits per pair
+```
+
+A damaged or truncated file stops gsc2ab with exit status 2, naming the last good special-q.
+
+## Checkpoints
+
+With `-ckpt FILE` gpusieve writes, after a special-q, the next special-q, the output's length and the totals to FILE
+(through a temporary file and a rename, after the output has been flushed to disk), at most every `-ckpt-interval`
+seconds. A run with `-resume` and the same poly file and parameters truncates the output to the recorded length and
+continues there; a checkpoint of other parameters is ignored. The checkpoint is removed when the run ends.
+
+## BOINC
+
+`make gpusieve HAVE_BOINC=1 BOINC_DIR=DIR` builds gpusieve as a BOINC application, against a BOINC source tree in DIR
+built with
+
+```
+git clone https://github.com/BOINC/boinc.git && cd boinc
+./_autosetup && ./configure --disable-server --disable-client --disable-manager && make
+```
+
+The release build is made in the `nvidia/cuda:12.8.1-devel-rockylinux8` image (glibc 2.28; the binary needs only
+GLIBC_2.17 symbols), for compute capabilities 5.0 to 12.0 with PTX for 8.0 (Rocky 8 needs
+`dnf --enablerepo=powertools install libstdc++-static`):
+
+```
+make gpusieve HAVE_BOINC=1 BOINC_DIR=/path/to/boinc CUDA_ARCH="50 52 60 61 70 75 80 86 89 90 100 120" CUDA_PTX=80
+```
+
+libstdc++, libgcc and the CUDA runtime are linked statically. Under a BOINC client gpusieve
+
+- takes its GPU from `init_data.xml` (`gpu_device_num`), else `--device N`;
+- resolves the logical names of `-poly`, `-out` and `-qfile`;
+- always checkpoints (to `gpusieve.ckpt` in the slot directory) when the client asks for one, and resumes from it;
+- reports the fraction done, and prints a progress line every 10 minutes;
+- exits temporarily (to be restarted later) when the GPU is missing or busy, or has too little free memory although it
+  has enough in all, and with an error otherwise.
+
+Note that the BOINC API redirects standard error to `stderr.txt` in the working directory, also for a run from a shell.
+
 ## Output format (.ab)
 
 A 16-byte header (`"NFAB"`, then version 1, side and flags as 32-bit integers), then 12 bytes per pair: `a` as a 64-bit
@@ -248,6 +306,7 @@ of each special-q before the next, in ascending order of special-q, and does not
 | `absort -merge [-side S] -o out.ab sorted.ab ...` | Merges `.ab` files that are already sorted (as absort writes them) in one pass, with 3 MB of memory per input, and removes duplicates (`-` reads one input from standard input). The output must not be an input. |
 | `absplit [-b B] [-side S] [-small s.ab] [-large l.ab] in.ab ...` | Splits `.ab` files by b, streaming: pairs with b < B (default 2^20) to `-small`, the others to `-large`, in input order (`-` reads standard input). `-side` sets the outputs' header side. |
 | `ab2keys file.ab ...` | Writes the pairs of `.ab` files as `a,b` lines. |
+| `gsc2ab [-o out.ab] in.gsc ...`, `gsc2ab -info in.gsc ...` | Turns compact files of `gpusieve -compact` into one `.ab` file (`-o -`: standard output), or lists their special-q and sizes. Checks each block's CRC. |
 | `lastq.py poly file.ab Q0 Q1 [-side S]` | The special-q of the last pair of an interrupted run, to continue with `-q0`. |
 | `lasnorm.pl` | Rewrites CADO-format relations as las prints them, so that `sort -u` removes relations found by both. |
 | `factorypoly.py N m [options]` | Searches for algebraic polynomials of a number N with a fixed rational side `x - m`, rated with CADO-NFS (`-cado` names its polyselect folder). |
@@ -267,7 +326,8 @@ The lattice bases and J are the same as las'.
 - `b` must stay below `2^32` (it has 32 bits in `.ab` files, NFS_factory and msieve). Larger `b` occur at large `-I`
   with large special-q (`-I 19`: above about `10^8`); such survivors are left out and counted at the end of the run.
 - Prime powers above `2^I` are not sieved; the slack covers most of them.
-- Tested on Linux only (absort maps its inputs into memory).
+- Tested on Linux only (absort maps its inputs into memory). The BOINC build runs on GPUs of compute capability 5.0 and
+  later.
 
 ## Authors and license
 

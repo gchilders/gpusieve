@@ -32,9 +32,28 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <cuda_runtime.h>
+#include "boinc_glue.h"
+#include "gsc.h"
 
-#define CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
+// CUDA errors: those that a later attempt on the same host can get past (no device or out of memory while other programs
+// use the GPU, a display watchdog, an ECC error) make a BOINC task exit temporarily, to be restarted from its checkpoint;
+// all others end the run with an error.
+[[noreturn]] static void cuda_fail(cudaError_t e, const char* file, int line)
+{
+	fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e), file, line);
+	switch (e) {
+	case cudaErrorMemoryAllocation: case cudaErrorNoDevice: case cudaErrorDevicesUnavailable: case cudaErrorLaunchTimeout:
+	case cudaErrorECCUncorrectable: case cudaErrorInitializationError: case cudaErrorDeviceUninitialized:
+		gs_boinc_temporary_exit(600, cudaGetErrorString(e));
+		break;
+	default: break;
+	}
+	gs_boinc_finish(1);
+}
+#define CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) cuda_fail(e_, __FILE__, __LINE__); } while (0)
 
 typedef unsigned __int128 u128;
 typedef __int128 i128;
@@ -249,6 +268,31 @@ static std::vector<uint64_t> primes_in(uint64_t lo, uint64_t hi)
 	return out;
 }
 
+// primes below n (n small: the sieving primes up to sqrt(lim))
+static std::vector<uint32_t> base_primes(uint32_t n)
+{
+	std::vector<uint8_t> comp(n + 1, 0); std::vector<uint32_t> out;
+	for (uint32_t p = 2; p < n; p++) { if (comp[p]) continue; out.push_back(p); for (uint64_t m = (uint64_t)p * p; m < n; m += p) comp[m] = 1; }
+	return out;
+}
+
+// primes in [lo, hi), lo >= 2, appended to out; base: all primes up to at least sqrt(hi)
+static void seg_primes(uint64_t lo, uint64_t hi, const std::vector<uint32_t>& base, std::vector<uint32_t>& out)
+{
+	const uint64_t W = 1 << 20;
+	std::vector<uint8_t> seg(W);
+	for (uint64_t s = lo; s < hi; s += W) {
+		const uint64_t e = std::min(hi, s + W);
+		std::fill(seg.begin(), seg.end(), 0);
+		for (uint32_t p : base) {
+			const uint64_t pp = (uint64_t)p * p;
+			if (pp >= e) break;
+			for (uint64_t m = std::max(pp, (s + p - 1) / p * p); m < e; m += p) seg[m - s] = 1;
+		}
+		for (uint64_t x = s; x < e; x++) if (!seg[x - s]) out.push_back((uint32_t)x);
+	}
+}
+
 // body(k) for k = 0 .. n-1 on nthreads threads (blocks of 64 indices)
 static void parallel_for(size_t n, int nthreads, const std::function<void(size_t)>& body)
 {
@@ -432,6 +476,8 @@ struct DevFB {
 	uint32_t* proj; uint32_t* nproj;            // the small entries with R = R_PROJ for this special-q (usually a few)
 	uint4* part; uint32_t* npart;               // small prime powers hitting only rows j = 0 mod p^e: (p^k/p^e, R', p^e, logp)
 	int n, nsmall;
+	int ktiny, kmed;                            // first small entry with modulus >= tiny, >= med (the entries are sorted)
+	int nline;                                  // the first nline large entries (I <= p < -line) are line sieved by k_rows
 };
 #ifndef CPAD
 #define CPAD 1                  // stride of the row counters (32 = one per 128-byte line: slower in tests)
@@ -524,7 +570,7 @@ __global__ void k_buckets(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, 
                           uint32_t* bucket, uint32_t* count, uint32_t cap, unsigned long long* dropped)
 {
 	const uint32_t I = 1u << logI, shift = logI - logR, rmask = (1u << logR) - 1;
-	for (int k = fb.nsmall + blockIdx.x * blockDim.x + threadIdx.x; k < fb.n; k += gridDim.x * blockDim.x) {
+	for (int k = fb.nsmall + fb.nline + blockIdx.x * blockDim.x + threadIdx.x; k < fb.n; k += gridDim.x * blockDim.x) {
 		uint32_t R = fb.R[k];
 		if (R == R_SKIP) continue;
 		uint32_t p = fb.p[k];
@@ -617,7 +663,7 @@ __device__ uint32_t gcd32(uint32_t a, uint32_t b)
 	return a << s;
 }
 
-struct OutPair { int64_t a; int64_t b; };
+struct OutPair { int32_t i; uint32_t j; };      // a survivor's lattice coordinates; the host computes (a,b)
 
 // one block per region (blocks loop over the regions when the grid is smaller): small primes into shared memory, then the
 // region's bucket, then the survivors. 3 blocks of 512 threads per SM: the shared memory (32 KB per block for I = 2^15) allows no more
@@ -667,14 +713,41 @@ k_rows(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jn, const 
 		const uint32_t m2 = e.x, start = region_start<MODE>(j / e.z, e.y, m2, I, x0);
 		for (uint32_t x = start + threadIdx.x * m2; x < RS; x += blockDim.x * m2) add_log(sh, x, e.w);
 	}
-	// other small primes: one thread each (entries are sorted by p; prime powers of tiny primes are also tiny)
-	for (int k = threadIdx.x; k < fb.nsmall; k += blockDim.x) {
+	// medium primes (tiny <= p < med, default 1024): one warp each, whose lanes share the hits. With one thread per prime the
+	// threads with the smallest of these primes (up to RS/tiny hits each) worked long after the others, and that loop took
+	// two thirds of the rows' time (RTX 4090, I = 16: rows 23 -> 12 ms; groups of 8 lanes above 1024 gained nothing).
+	{
+		const uint32_t lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+		for (int k = fb.ktiny + (int)(threadIdx.x >> 5); k < fb.kmed; k += nw) {
+			const uint32_t p = fb.p[k], R = fb.R[k];
+			if (R >= R_PROJ) continue;
+			const uint32_t lp = fb.logp[k];
+			for (uint32_t x = region_start<MODE>(j, R, p, I, x0) + lane * p; x < RS; x += 32 * p) add_log(sh, x, lp);
+		}
+	}
+	// other small primes (p >= med): one thread each (entries are sorted by p; at most RS/med hits each)
+	for (int k = fb.kmed + threadIdx.x; k < fb.nsmall; k += blockDim.x) {
 		uint32_t p = fb.p[k];
-		if (p < tiny) continue;
 		uint32_t R = fb.R[k];
 		if (R >= R_PROJ) continue;
 		uint32_t lp = fb.logp[k];
 		for (uint32_t x = region_start<MODE>(j, R, p, I, x0); x < RS; x += p) add_log(sh, x, lp);
+	}
+	// line primes (I <= p < -line): at most one hit per row, at x = (j*R + I/2) mod p (the Franke-Kleinjung walk of the
+	// buckets enumerates the same points; R = 0 has only non-coprime ones). Testing each such prime in each region is
+	// cheaper than its bucket entries for p up to a few times I: a bucket entry costs two L2 transactions (count atomic,
+	// scattered store), the test one reduction. The quotient comes from a float reciprocal and is corrected exactly.
+	for (int k = fb.nsmall + threadIdx.x; k < fb.nsmall + fb.nline; k += blockDim.x) {
+		const uint32_t R = fb.R[k];
+		if (R == 0 || R >= R_PROJ) continue;
+		const uint32_t p = fb.p[k];
+		const uint64_t t = (uint64_t)j * R + (I >> 1);
+		const uint64_t qt = (uint64_t)((float)t * __frcp_rn((float)p));
+		int64_t r = (int64_t)t - (int64_t)(qt * p);
+		while (r < 0) r += p;
+		while (r >= (int64_t)p) r -= p;
+		const uint32_t x = (uint32_t)r - x0;
+		if (x < RS) add_log(sh, x, fb.logp[k]);
 	}
 	// large primes from the bucket of this region
 	uint32_t n = min(count[(size_t)g * CPAD], cap);
@@ -724,7 +797,7 @@ k_rows(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jn, const 
 		if (b < 0) { a = -a; b = -b; }
 		if (dummy && log2(fabs((double)c1 * (double)a + (double)c0 * (double)b) + 1) >= dummy_bits) continue;
 		unsigned int slot = atomicAdd(nout, 1u);
-		if (slot < maxout) { out[slot].a = a; out[slot].b = b; }
+		if (slot < maxout) { out[slot].i = (int32_t)i; out[slot].j = j; }
 	}
 	}
 }
@@ -735,10 +808,22 @@ int main(int argc, char** argv)
 {
 	const char* polyf = nullptr; const char* outf = nullptr; const char* qfile = nullptr;
 	int logI = 15; uint64_t lim = 25000000; int mfb = 56; double slack = 12;
-	uint64_t q0 = 0, q1 = 0; long nrandom = 0; uint32_t tiny = 64; int verbose = 0; double dummy_bits = 32; int oldbuckets = 1;
+	uint64_t q0 = 0, q1 = 0; long nrandom = 0; uint32_t tiny = 64, med = 1024; long long line_opt = -1; int verbose = 0; double dummy_bits = 32; int oldbuckets = 1;
 	int lanes = 1, bblocks = 0, rblocks = 0; double progress_s = 60; int side = -1; const char* dumpfb = nullptr; double maxout_m = 16;
 	long nparts_opt = 0;
 	int nthreads = (int)std::min(16u, std::max(1u, std::thread::hardware_concurrency()));
+	// checkpoints: -ckpt FILE names the checkpoint (under BOINC always on, default "gpusieve.ckpt" in the slot directory);
+	// -resume continues a standalone run from it. -device N: the CUDA device (BOINC: the client's assignment wins).
+	const char* ckptf = nullptr; bool resume = false; bool compact = false; double ckpt_s = 60; int device = -1;
+	if (gs_boinc_init()) return 1;
+	const bool boinc = gs_boinc_managed();
+	if (boinc) {
+		progress_s = 600;
+		// the host threads only work at startup (factor base, special-q roots); stay within what the client gives the task,
+		// but use a few cores for that burst
+		const double nc = gs_boinc_ncpus();
+		nthreads = (int)std::max(1.0, std::min<double>(nthreads, std::max(4.0, nc)));
+	}
 	for (int k = 1; k < argc; k++) {
 		std::string s = argv[k];
 		auto nxt = [&]() { if (k + 1 >= argc) { fprintf(stderr, "missing value for %s\n", s.c_str()); exit(1); } return argv[++k]; };
@@ -746,13 +831,18 @@ int main(int argc, char** argv)
 		else if (s == "-I") logI = atoi(nxt()); else if (s == "-lim") lim = strtoull(nxt(), 0, 10);
 		else if (s == "-mfb") mfb = atoi(nxt()); else if (s == "-slack") slack = atof(nxt());
 		else if (s == "-q0") q0 = strtoull(nxt(), 0, 10); else if (s == "-q1") q1 = strtoull(nxt(), 0, 10);
-		else if (s == "-random") nrandom = atol(nxt()); else if (s == "-tiny") tiny = atoi(nxt());
+		else if (s == "-random") nrandom = atol(nxt()); else if (s == "-tiny") tiny = atoi(nxt()); else if (s == "-med") med = atoi(nxt()); else if (s == "-line") line_opt = atoll(nxt());
 		else if (s == "-dummybits") dummy_bits = atof(nxt());
 		else if (s == "-twopass") oldbuckets = 0;
 		else if (s == "-lanes") lanes = std::max(1, std::min(2, atoi(nxt())));
 		else if (s == "-bblocks") bblocks = atoi(nxt()); else if (s == "-rblocks") rblocks = atoi(nxt());
 		else if (s == "-v") verbose = 1;
 		else if (s == "-progress") progress_s = atof(nxt());
+		else if (s == "-ckpt") ckptf = nxt();
+		else if (s == "-ckpt-interval") ckpt_s = atof(nxt());
+		else if (s == "-resume") resume = true;
+		else if (s == "-compact") compact = true;
+		else if (s == "-device" || s == "--device") device = atoi(nxt());
 		else if (s == "-side") side = atoi(nxt());
 		else if (s == "-threads") nthreads = std::max(1, atoi(nxt()));
 		else if (s == "-dumpfb") dumpfb = nxt();
@@ -761,6 +851,23 @@ int main(int argc, char** argv)
 		else { fprintf(stderr, "unknown option %s\n", s.c_str()); return 1; }
 	}
 	if (!polyf || (!dumpfb && (!outf || (!qfile && (!q0 || !q1))))) { fprintf(stderr, "usage: see the top of gpusieve.cu\n"); return 1; }
+	// BOINC: logical file names; the checkpoint lives in the slot directory and is always used
+	polyf = gs_boinc_resolve(polyf);
+	if (outf) outf = gs_boinc_resolve(outf);
+	if (qfile) qfile = gs_boinc_resolve(qfile);
+	if (boinc) { if (!ckptf) ckptf = "gpusieve.ckpt"; resume = true; }
+	// the CUDA device: the client's assignment, else -device, else 0
+	{
+		const int bd = gs_boinc_gpu_device();
+		if (bd >= 0) device = bd;
+		if (device < 0) device = 0;
+		int ndev = 0; CHECK(cudaGetDeviceCount(&ndev));
+		if (device >= ndev) { fprintf(stderr, "device %d requested, %d present\n", device, ndev); gs_boinc_finish(1); }
+		CHECK(cudaSetDevice(device));
+		cudaDeviceProp pr; CHECK(cudaGetDeviceProperties(&pr, device));
+		fprintf(stderr, "GPU %d: %s, compute capability %d.%d, %d SMs, %.1f GB\n", device, pr.name, pr.major, pr.minor,
+			pr.multiProcessorCount, pr.totalGlobalMem / 1e9);
+	}
 	Poly P = read_poly(polyf);
 	// the sieved side and the other (linear) side
 	if (side < 0) side = P.alg_deg >= 2 ? 1 : 0;
@@ -804,81 +911,118 @@ int main(int argc, char** argv)
 	if (!oldbuckets && rpr > 1) { fprintf(stderr, "-twopass needs I <= 15\n"); return 1; }
 	auto t_start = std::chrono::steady_clock::now();
 
-	// factor base: primes up to lim; prime powers below I for the small primes
+	// factor base: primes up to lim; prime powers below I for the small primes. The large entries (p >= I, nearly all of
+	// them) are built in chunks of the range by a segmented sieve, straight into arrays of p, y0 and y1 (12 bytes per
+	// entry; base = p and logp follow from p), so that the host needs little more than the factor base itself.
 	if (lim >= (1ull << 32)) { fprintf(stderr, "lim must be below 2^32\n"); return 1; }
-	std::vector<uint32_t> fbprimes; {
-		std::vector<uint8_t> comp(lim + 1, 0);
-		for (uint64_t p = 2; p <= lim; p++) {
-			if (comp[p]) continue;
-			fbprimes.push_back((uint32_t)p);
-			for (uint64_t m = p * p; m <= lim; m += p) comp[m] = 1;
-		}
-	}
+	const std::vector<uint32_t> sieve_primes = base_primes((uint32_t)sqrtl((long double)lim) + 2);
 	struct E { uint32_t p, base, y0, y1; uint8_t lg; };
-	std::vector<E> small, large;
+	std::vector<E> small;
 	auto lgp = [](uint64_t p) { return (uint8_t)lround(log2((double)p)); };
-	if (!poly_norm) {       // linear: (y1, y0) = (c1, c0) mod p^k
-		for (uint32_t p : fbprimes) {
-			if (p < I) {
+	std::vector<uint32_t> lpv, ly0, ly1;                 // large entries
+	{
+		std::vector<uint32_t> sp;                        // primes below I (and up to lim)
+		seg_primes(2, std::min<uint64_t>(I, lim + 1), sieve_primes, sp);
+		if (!poly_norm) {       // linear: (y1, y0) = (c1, c0) mod p^k
+			for (uint32_t p : sp)
 				for (uint64_t pk = p; pk < I; pk *= p)
 					small.push_back({(uint32_t)pk, p, (uint32_t)mod_str(g_spoly[0], pk), (uint32_t)mod_str(g_spoly[1], pk), lgp(p)});
-			} else large.push_back({p, p, (uint32_t)mod_str(g_spoly[0], p), (uint32_t)mod_str(g_spoly[1], p), lgp(p)});
-		}
-	} else {                // degree >= 2: one entry per root, (y1, y0) = (1, -r) or (-s, 1) mod p^k
-		uint64_t f[MAXD + 1], rv[MAXD + 1];
-		std::vector<uint64_t> roots, s;
-		for (uint32_t p : fbprimes) {
-			if (p >= I) break;
-			spoly_mod(p, f);
-			if (!roots_mod_p(f, sdeg, p, roots)) { fprintf(stderr, "every value of the sieved side is divisible by %u: not sieved\n", p); continue; }
-			const bool proj = f[sdeg] == 0;
-			for (uint64_t m = p; m < I && !roots.empty(); m *= p) {      // affine roots mod p^k, lifted from those mod p^(k-1)
-				if (m > p) { spoly_mod(m, f); roots = lift_roots(f, sdeg, m, p, roots); }
-				for (uint64_t r : roots) small.push_back({(uint32_t)m, p, (uint32_t)((m - r) % m), 1, lgp(p)});
-			}
-			s.assign(proj ? 1 : 0, 0);                                    // projective: roots s = 0 mod p of the reversed polynomial
-			for (uint64_t m = p; m < I && !s.empty(); m *= p) {
-				if (m > p) { spoly_mod(m, f); for (int k = 0; k <= sdeg; k++) rv[k] = f[sdeg - k]; s = lift_roots(rv, sdeg, m, p, s); }
-				for (uint64_t x : s) small.push_back({(uint32_t)m, p, 1, (uint32_t)((m - x) % m), lgp(p)});
-			}
-		}
-		const size_t first = std::lower_bound(fbprimes.begin(), fbprimes.end(), I) - fbprimes.begin(), nl = fbprimes.size() - first;
-		const size_t nchunk = 4096;
-		std::vector<std::vector<E>> part(nchunk);
-		parallel_for(nchunk, nthreads, [&](size_t c) {
-			uint64_t f[MAXD + 1]; std::vector<uint64_t> roots;
-			for (size_t t = first + nl * c / nchunk; t < first + nl * (c + 1) / nchunk; t++) {
-				const uint32_t p = fbprimes[t];
+		} else {                // degree >= 2: one entry per root, (y1, y0) = (1, -r) or (-s, 1) mod p^k
+			uint64_t f[MAXD + 1], rv[MAXD + 1];
+			std::vector<uint64_t> roots, s;
+			for (uint32_t p : sp) {
 				spoly_mod(p, f);
-				if (!roots_mod_p(f, sdeg, p, roots)) continue;
-				for (uint64_t r : roots) part[c].push_back({p, p, (uint32_t)((p - r) % p), 1, lgp(p)});
-				if (f[sdeg] == 0) part[c].push_back({p, p, 1, 0, lgp(p)});
+				if (!roots_mod_p(f, sdeg, p, roots)) { fprintf(stderr, "every value of the sieved side is divisible by %u: not sieved\n", p); continue; }
+				const bool proj = f[sdeg] == 0;
+				for (uint64_t m = p; m < I && !roots.empty(); m *= p) {      // affine roots mod p^k, lifted from those mod p^(k-1)
+					if (m > p) { spoly_mod(m, f); roots = lift_roots(f, sdeg, m, p, roots); }
+					for (uint64_t r : roots) small.push_back({(uint32_t)m, p, (uint32_t)((m - r) % m), 1, lgp(p)});
+				}
+				s.assign(proj ? 1 : 0, 0);                                    // projective: roots s = 0 mod p of the reversed polynomial
+				for (uint64_t m = p; m < I && !s.empty(); m *= p) {
+					if (m > p) { spoly_mod(m, f); for (int k = 0; k <= sdeg; k++) rv[k] = f[sdeg - k]; s = lift_roots(rv, sdeg, m, p, s); }
+					for (uint64_t x : s) small.push_back({(uint32_t)m, p, 1, (uint32_t)((m - x) % m), lgp(p)});
+				}
 			}
-		});
-		for (const auto& v : part) large.insert(large.end(), v.begin(), v.end());
+		}
+		if ((uint64_t)I <= lim) {
+			const uint64_t lo = I, hi = lim + 1;
+			const size_t nchunk = 4096;
+			struct Chunk { std::vector<uint32_t> p, y0, y1; };
+			std::vector<Chunk> part(nchunk);
+			parallel_for(nchunk, nthreads, [&](size_t c) {
+				std::vector<uint32_t> ps;
+				seg_primes(lo + (hi - lo) * c / nchunk, lo + (hi - lo) * (c + 1) / nchunk, sieve_primes, ps);
+				Chunk& C = part[c];
+				if (!poly_norm) {
+					C.p = ps; C.y0.resize(ps.size()); C.y1.resize(ps.size());
+					for (size_t t = 0; t < ps.size(); t++) { C.y0[t] = (uint32_t)mod_str(g_spoly[0], ps[t]); C.y1[t] = (uint32_t)mod_str(g_spoly[1], ps[t]); }
+				} else {
+					uint64_t f[MAXD + 1]; std::vector<uint64_t> roots;
+					for (uint32_t p : ps) {
+						spoly_mod(p, f);
+						if (!roots_mod_p(f, sdeg, p, roots)) continue;
+						for (uint64_t r : roots) { C.p.push_back(p); C.y0.push_back((uint32_t)((p - r) % p)); C.y1.push_back(1); }
+						if (f[sdeg] == 0) { C.p.push_back(p); C.y0.push_back(1); C.y1.push_back(0); }   // projective: (-s, 1), s = 0
+					}
+				}
+			});
+			size_t tot = 0; for (const Chunk& C : part) tot += C.p.size();
+			lpv.reserve(tot); ly0.reserve(tot); ly1.reserve(tot);
+			for (Chunk& C : part) {
+				lpv.insert(lpv.end(), C.p.begin(), C.p.end()); ly0.insert(ly0.end(), C.y0.begin(), C.y0.end());
+				ly1.insert(ly1.end(), C.y1.begin(), C.y1.end());
+				std::vector<uint32_t>().swap(C.p); std::vector<uint32_t>().swap(C.y0); std::vector<uint32_t>().swap(C.y1);
+			}
+		}
 	}
 	// small entries sorted by modulus (prime powers of tiny primes stay tiny)
 	std::sort(small.begin(), small.end(), [](const E& x, const E& y) { return x.p < y.p; });
-	int nsmall = (int)small.size();
-	small.insert(small.end(), large.begin(), large.end());
+	const int nsmall = (int)small.size();
+	const size_t nlg = lpv.size();
+	if ((size_t)nsmall + nlg >= (1ull << 31)) { fprintf(stderr, "factor base too large (%zu entries)\n", nsmall + nlg); return 1; }
 	if (dumpfb) {           // debug: the factor base as "modulus prime y1 y0" (hits: modulus | y1*a + y0*b)
 		FILE* d = fopen(dumpfb, "w"); if (!d) { perror(dumpfb); return 1; }
 		for (const E& e : small) fprintf(d, "%u %u %u %u\n", e.p, e.base, e.y1, e.y0);
+		for (size_t t = 0; t < nlg; t++) fprintf(d, "%u %u %u %u\n", lpv[t], lpv[t], ly1[t], ly0[t]);
 		fclose(d);
-		fprintf(stderr, "factor base: %zu entries (%d below I) written to %s in %.1f s\n", small.size(), nsmall, dumpfb,
+		fprintf(stderr, "factor base: %zu entries (%d below I) written to %s in %.1f s\n", nsmall + nlg, nsmall, dumpfb,
 			std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
 		return 0;
 	}
-	std::vector<uint32_t> fp, fbase, f0, f1; std::vector<uint8_t> fl;
-	for (const E& e : small) { fp.push_back(e.p); fbase.push_back(e.base); f0.push_back(e.y0); f1.push_back(e.y1); fl.push_back(e.lg); }
-	DevFB fb; fb.n = (int)fp.size(); fb.nsmall = nsmall; fb.proj = fb.nproj = fb.npart = nullptr; fb.part = nullptr;
-	CHECK(cudaMalloc(&fb.p, fb.n * 4)); CHECK(cudaMalloc(&fb.base, fb.n * 4)); CHECK(cudaMalloc(&fb.y0, fb.n * 4)); CHECK(cudaMalloc(&fb.y1, fb.n * 4));
-	CHECK(cudaMemcpy(fb.base, fbase.data(), fb.n * 4, cudaMemcpyHostToDevice));
-	CHECK(cudaMalloc(&fb.logp, fb.n)); CHECK(cudaMalloc(&fb.R, fb.n * 4));
-	CHECK(cudaMemcpy(fb.p, fp.data(), fb.n * 4, cudaMemcpyHostToDevice));
-	CHECK(cudaMemcpy(fb.y0, f0.data(), fb.n * 4, cudaMemcpyHostToDevice));
-	CHECK(cudaMemcpy(fb.y1, f1.data(), fb.n * 4, cudaMemcpyHostToDevice));
-	CHECK(cudaMemcpy(fb.logp, fl.data(), fb.n, cudaMemcpyHostToDevice));
+	DevFB fb; fb.n = (int)(nsmall + nlg); fb.nsmall = nsmall; fb.proj = fb.nproj = fb.npart = nullptr; fb.part = nullptr;
+	fb.ktiny = (int)(std::find_if(small.begin(), small.end(), [&](const E& e) { return e.p >= tiny; }) - small.begin());
+	med = std::max(med, tiny);
+	// line-sieved large entries: I <= p < line_lim (below 2^20, so that j*R stays far below the float quotient's limits).
+	// Default 2^17 for I <= 2^16 (RTX 4090: 7 % faster at I = 16, 12 % at 15, 24 % at 13; T4: 2 % at 16, 0 at 15); none for
+	// larger I, whose rows have several regions, each of which tests every line prime again (I = 17, 4090: 13 % slower).
+	uint64_t line_lim = line_opt >= 0 ? (uint64_t)line_opt : logI <= 16 ? (1u << 17) : 0;
+	line_lim = std::min<uint64_t>(line_lim, 1u << 20);
+	fb.nline = (int)(std::lower_bound(lpv.begin(), lpv.end(), (uint32_t)std::min<uint64_t>(line_lim, 0xffffffffu)) - lpv.begin());
+	if (line_lim <= I) fb.nline = 0;
+	fb.kmed = (int)(std::find_if(small.begin(), small.end(), [&](const E& e) { return e.p >= med; }) - small.begin());
+	CHECK(cudaMalloc(&fb.p, (size_t)fb.n * 4)); CHECK(cudaMalloc(&fb.base, (size_t)fb.n * 4)); CHECK(cudaMalloc(&fb.y0, (size_t)fb.n * 4));
+	CHECK(cudaMalloc(&fb.y1, (size_t)fb.n * 4)); CHECK(cudaMalloc(&fb.logp, (size_t)fb.n)); CHECK(cudaMalloc(&fb.R, (size_t)fb.n * 4));
+	{   // the small entries, then the large ones behind them (base = p)
+		std::vector<uint32_t> a(nsmall), b(nsmall), c(nsmall), d(nsmall); std::vector<uint8_t> l(nsmall);
+		for (int t = 0; t < nsmall; t++) { a[t] = small[t].p; b[t] = small[t].base; c[t] = small[t].y0; d[t] = small[t].y1; l[t] = small[t].lg; }
+		CHECK(cudaMemcpy(fb.p, a.data(), (size_t)nsmall * 4, cudaMemcpyHostToDevice));
+		CHECK(cudaMemcpy(fb.base, b.data(), (size_t)nsmall * 4, cudaMemcpyHostToDevice));
+		CHECK(cudaMemcpy(fb.y0, c.data(), (size_t)nsmall * 4, cudaMemcpyHostToDevice));
+		CHECK(cudaMemcpy(fb.y1, d.data(), (size_t)nsmall * 4, cudaMemcpyHostToDevice));
+		CHECK(cudaMemcpy(fb.logp, l.data(), (size_t)nsmall, cudaMemcpyHostToDevice));
+		CHECK(cudaMemcpy(fb.p + nsmall, lpv.data(), nlg * 4, cudaMemcpyHostToDevice));
+		CHECK(cudaMemcpy(fb.base + nsmall, lpv.data(), nlg * 4, cudaMemcpyHostToDevice));
+		CHECK(cudaMemcpy(fb.y0 + nsmall, ly0.data(), nlg * 4, cudaMemcpyHostToDevice));
+		CHECK(cudaMemcpy(fb.y1 + nsmall, ly1.data(), nlg * 4, cudaMemcpyHostToDevice));
+		std::vector<uint8_t> ll(nlg); for (size_t t = 0; t < nlg; t++) ll[t] = lgp(lpv[t]);
+		CHECK(cudaMemcpy(fb.logp + nsmall, ll.data(), nlg, cudaMemcpyHostToDevice));
+	}
+	// fp: the moduli on the host (the bucket chunking and the expected bucket fill below use them)
+	std::vector<uint32_t> fp(fb.n);
+	for (int t = 0; t < nsmall; t++) fp[t] = small[t].p;
+	std::copy(lpv.begin(), lpv.end(), fp.begin() + nsmall);
+	std::vector<uint32_t>().swap(lpv); std::vector<uint32_t>().swap(ly0); std::vector<uint32_t>().swap(ly1);
 	fprintf(stderr, "factor base: %d entries (%d below I = %u), set up in %.1f s\n", fb.n, nsmall, I,
 		std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
 
@@ -937,9 +1081,10 @@ int main(int argc, char** argv)
 	// chunks of large primes with equal expected hits (about I*J/p each), for k_buckets2
 	const int nchunks = 320;
 	std::vector<int> hchunk; {
-		double total = 0; for (int k = nsmall; k < fb.n; k++) total += 1.0 / fp[k];
-		double acc = 0; hchunk.push_back(nsmall);
-		for (int k = nsmall; k < fb.n; k++) { acc += 1.0 / fp[k]; if (acc >= total * hchunk.size() / nchunks && (int)hchunk.size() < nchunks) hchunk.push_back(k + 1); }
+		const int kb = nsmall + fb.nline;     // the first bucket-sieved entry
+		double total = 0; for (int k = kb; k < fb.n; k++) total += 1.0 / fp[k];
+		double acc = 0; hchunk.push_back(kb);
+		for (int k = kb; k < fb.n; k++) { acc += 1.0 / fp[k]; if (acc >= total * hchunk.size() / nchunks && (int)hchunk.size() < nchunks) hchunk.push_back(k + 1); }
 		hchunk.push_back(fb.n);
 	}
 	int* dchunk; CHECK(cudaMalloc(&dchunk, hchunk.size() * sizeof(int)));
@@ -956,7 +1101,7 @@ int main(int argc, char** argv)
 	// its own rows only; the large primes' walks continue from one pass to the next (k_buckets, st: 8 bytes per large entry).
 	const uint32_t Jmax = I >> 1;
 	const int nlarge = fb.n - fb.nsmall;
-	double inv_sum = 0; for (int k = nsmall; k < fb.n; k++) inv_sum += 1.0 / fp[k];
+	double inv_sum = 0; for (int k = nsmall + fb.nline; k < fb.n; k++) inv_sum += 1.0 / fp[k];
 	const double expect = RS * inv_sum;
 	const uint32_t cap = ((uint32_t)(1.3 * expect + 10 * sqrt(expect)) + 255) & ~255u;
 	const unsigned int maxout = (unsigned int)std::min<double>(maxout_m * 1048576.0, 4e9);
@@ -978,7 +1123,7 @@ int main(int argc, char** argv)
 			// the ends of the buckets being filled stay in the L2 cache. In tests, a 4.5 MB L2 was fastest with 16384 regions
 			// per pass at I = 16 and 17 (1.5 times faster than one pass), a 96 MB L2 with 65536 at I = 16 to 19 (1.25 times
 			// faster than 262144); more passes cost about 1 ms each.
-			int l2 = 0; CHECK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0));
+			int l2 = 0; CHECK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device));
 			const size_t maxreg = std::min<size_t>((size_t)l2 / 256, 65536);
 			while (nparts < Jmax && (need_for(nparts) > freeb * 0.95 || (size_t)(Jmax / nparts) * rpr > maxreg)) nparts *= 2;
 		}
@@ -988,7 +1133,9 @@ int main(int argc, char** argv)
 			Jmax / nparts, need / 1e9, freeb / 1e9);
 		if (need > freeb * 0.95) {
 			fprintf(stderr, "not enough GPU memory%s\n", lanes > 1 ? ": try -lanes 1" : nparts_opt > 0 ? ": try a larger -parts" : "");
-			return 1;
+			// the factor base itself is already on the GPU; if the GPU as a whole has room, other programs hold the rest: retry later
+			if (need < totalb * 0.85) gs_boinc_temporary_exit(1800, "not enough free GPU memory");
+			gs_boinc_finish(1);
 		}
 	}
 	if (!oldbuckets && nparts > 1) { fprintf(stderr, "-twopass needs a single pass (-parts 1)\n"); return 1; }
@@ -1006,14 +1153,14 @@ int main(int argc, char** argv)
 	}
 	struct Slot {
 		OutPair* dout; unsigned int* dn; unsigned long long* dropped; uint32_t* drow0;    // device
-		OutPair* hout; unsigned int* hn; unsigned long long* hdropped; uint32_t* hrow0;   // pinned host
+		unsigned int* hn; unsigned long long* hdropped; uint32_t* hrow0;                  // pinned host
 		cudaEvent_t e[6];                         // e[0..1]: transform timing; e[5]: n and dropped copied
 		std::vector<cudaEvent_t> pe;              // per pass: buckets start, end, rows start, end
 		uint32_t used;                            // passes of the special-q in this slot
 	} slot[2];
 	for (Slot& s : slot) {
 		CHECK(cudaMalloc(&s.dout, (size_t)maxout * sizeof(OutPair))); CHECK(cudaMalloc(&s.dn, 4)); CHECK(cudaMalloc(&s.dropped, 8));
-		CHECK(cudaMallocHost(&s.hout, (size_t)maxout * sizeof(OutPair))); CHECK(cudaMallocHost(&s.hn, 4));
+		CHECK(cudaMallocHost(&s.hn, 4));
 		CHECK(cudaMallocHost(&s.hdropped, 8));
 		CHECK(cudaMalloc(&s.drow0, 4)); CHECK(cudaMallocHost(&s.hrow0, 4));
 		for (cudaEvent_t& ev : s.e) CHECK(cudaEventCreate(&ev));
@@ -1021,24 +1168,24 @@ int main(int argc, char** argv)
 		for (cudaEvent_t& ev : s.pe) CHECK(cudaEventCreate(&ev));
 		s.used = 0;
 	}
+	// one pinned host buffer for the survivors: process() copies and writes one special-q at a time
+	OutPair* hout; CHECK(cudaMallocHost(&hout, (size_t)maxout * sizeof(OutPair)));
 	cudaStream_t sb, sr, cs;
 	CHECK(cudaStreamCreateWithFlags(&sb, cudaStreamNonBlocking)); CHECK(cudaStreamCreateWithFlags(&sr, cudaStreamNonBlocking));
 	CHECK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
-	int nsm = 0; CHECK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0));
-	FILE* out = fopen(outf, "wb");
-	if (!out) { fprintf(stderr, "cannot write %s\n", outf); return 1; }
-	// header: version 1, the side whose factors NFS_factory rebuilds (the other side; NFS_factory checks the sieved one)
-	uint32_t header[4] = {0, 1, (uint32_t)(1 - side), 0}; memcpy(header, "NFAB", 4); fwrite(header, sizeof header, 1, out);
+	int nsm = 0; CHECK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, device));
+	FILE* out = nullptr;      // opened below, fresh or resumed from a checkpoint
 	std::vector<char> wbuf;
+	std::vector<uint64_t> keys, ktmp; std::vector<uint8_t> cbuf;     // -compact
 	// With a persistent row grid of rblocks blocks per SM, each block asks for 1/rblocks of the SM's shared memory, so that
 	// exactly rblocks blocks run on every SM (otherwise the scheduler can stack them unevenly, and the SMs with more blocks
 	// set the pace).
 	size_t rsmem = RS;
 	if (rblocks > 0) {
 		int smem_sm = 0, smem_res = 0, smem_optin = 0;
-		CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, 0));
-		CHECK(cudaDeviceGetAttribute(&smem_res, cudaDevAttrReservedSharedMemoryPerBlock, 0));
-		CHECK(cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+		CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device));
+		CHECK(cudaDeviceGetAttribute(&smem_res, cudaDevAttrReservedSharedMemoryPerBlock, device));
+		CHECK(cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
 		size_t share = (size_t)(smem_sm / rblocks - smem_res) & ~(size_t)255;
 		rsmem = std::max<size_t>(RS, std::min<size_t>(share, smem_optin));
 	}
@@ -1123,15 +1270,19 @@ int main(int argc, char** argv)
 			fprintf(stderr, "q=%llu: %u survivors, only %u kept (raise -maxout)\n", (unsigned long long)Q.q, n, maxout);
 			n = maxout; total_trunc++;
 		}
-		CHECK(cudaMemcpyAsync(s.hout, s.dout, (size_t)n * sizeof(OutPair), cudaMemcpyDeviceToHost, cs));
+		CHECK(cudaMemcpyAsync(hout, s.dout, (size_t)n * sizeof(OutPair), cudaMemcpyDeviceToHost, cs));
 		CHECK(cudaStreamSynchronize(cs));
 		// gcd(i,j) = 1 was checked on the GPU, so gcd(a,b) is 1 or q
 		const int64_t q = (int64_t)Q.q;
 		wbuf.resize((size_t)(n + 1) * 12); char* w = wbuf.data();
+		keys.clear();                   // -compact: the keys j*I + (i + I/2) of the pairs written
 		for (unsigned int t = 0; t < n; t++) {
-			int64_t a = s.hout[t].a, b = s.hout[t].b;
+			const int64_t i = hout[t].i, j = hout[t].j;
+			int64_t a = i * Q.a0 + j * Q.a1, b = i * Q.b0 + j * Q.b1;
+			if (b < 0) { a = -a; b = -b; }
 			if (b >= (1ll << 32)) { total_bigb++; continue; }
 			if (a % q == 0 && b % q == 0) continue;
+			if (compact) { keys.push_back(((uint64_t)j << logI) | (uint64_t)(i + (I >> 1))); continue; }
 			uint32_t b32 = (uint32_t)b; memcpy(w, &a, 8); memcpy(w + 8, &b32, 4); w += 12;
 		}
 		{   // row j = 0 is not sieved; its only coprime point (i,j) = (1,0) is (a0,b0). It survives like every other point: if
@@ -1147,10 +1298,17 @@ int main(int argc, char** argv)
 			for (int t = 0; t <= sdeg; t++) { long double pb = 1; for (int u = t; u < sdeg; u++) pb *= (long double)b; F += sc[t] * pa * pb; pa *= (long double)a; }
 			const bool sieved_ok = F != 0 && (double)*s.hrow0 >= (double)log2l(fabsl(F) / (long double)Q.q) - (double)(mfb + slack);
 			if (b > 0 && b < (1ll << 32) && g == 1 && dummy_ok && sieved_ok) {
-				uint32_t b32 = (uint32_t)b; memcpy(w, &a, 8); memcpy(w + 8, &b32, 4); w += 12; n++;
+				if (compact) keys.push_back((uint64_t)(1 + (I >> 1)));    // (i,j) = (1,0)
+				else { uint32_t b32 = (uint32_t)b; memcpy(w, &a, 8); memcpy(w + 8, &b32, 4); w += 12; }
+				n++;
 			}
 		}
-		fwrite(wbuf.data(), 1, w - wbuf.data(), out);
+		if (compact) {
+			gsc::sort_keys(keys, ktmp);
+			cbuf.clear();
+			gsc::encode_block(cbuf, Q.q, Q.r, Q.a0, Q.b0, Q.a1, Q.b1, keys);
+			fwrite(cbuf.data(), 1, cbuf.size(), out);
+		} else fwrite(wbuf.data(), 1, w - wbuf.data(), out);
 		total_out += n; total_drop += dr; positions += (uint64_t)I * (Q.J - 1);
 		if (verbose) fprintf(stderr, "q=%llu J=%u: %u survivors, %llu bucket entries dropped, %u pass%s, %.2f + %.2f + %.2f ms\n",
 			(unsigned long long)Q.q, Q.J, n, dr, s.used, s.used > 1 ? "es" : "", ms1, ms2, ms3);
@@ -1158,30 +1316,100 @@ int main(int argc, char** argv)
 
 	// the host stays up to two special-q ahead of the one it writes (output slot (k+2)&1 = k&1 is free only after process(k))
 	// progress: a line every progress_s seconds (the last special-q written, the share done, the time left)
+	// Checkpoints. After special-q k is written, the checkpoint records k+1, the output's length and the totals; it is
+	// written to a temporary file and renamed, after the output has been flushed to disk, so that it never points past
+	// the output. A resumed run truncates the output to the recorded length (dropping survivors written after the last
+	// checkpoint) and continues with special-q k+1. The run's parameters are hashed into the checkpoint, and a checkpoint
+	// of other parameters is ignored.
+	uint64_t phash = 1469598103934665603ull;
+	auto mix = [&](const void* d, size_t n) { for (size_t t = 0; t < n; t++) { phash ^= ((const uint8_t*)d)[t]; phash *= 1099511628211ull; } };
+	{
+		auto mixfile = [&](const char* f) { FILE* h = fopen(f, "rb"); if (!h) return; char buf[65536]; size_t r;
+			while ((r = fread(buf, 1, sizeof buf, h)) > 0) mix(buf, r); fclose(h); };
+		mixfile(polyf); if (qfile) mixfile(qfile);
+		const double pv[] = {(double)side, (double)logI, (double)lim, (double)mfb, slack, (double)q0, (double)q1, (double)nrandom,
+		                     dummy_bits, (double)maxout, (double)tiny, (double)qs.size(), (double)compact};
+		mix(pv, sizeof pv);
+	}
+	size_t k0 = 0;
+	if (ckptf && resume) {
+		FILE* c = fopen(ckptf, "r");
+		if (c) {
+			unsigned long long h = 0, kk = 0, off = 0, to = 0, td = 0, po = 0, tt = 0, tb = 0;
+			const int got = fscanf(c, "gpusieve-ckpt 1 %llx %llu %llu %llu %llu %llu %llu %llu", &h, &kk, &off, &to, &td, &po, &tt, &tb);
+			fclose(c);
+			struct stat st;
+			if (got != 8 || h != phash || kk > qs.size()) fprintf(stderr, "checkpoint %s: not for this run, starting over\n", ckptf);
+			else if (stat(outf, &st) != 0 || (unsigned long long)st.st_size < off)
+				fprintf(stderr, "checkpoint %s: the output %s is shorter than recorded, starting over\n", ckptf, outf);
+			else {
+				out = fopen(outf, "r+b");
+				if (!out || ftruncate(fileno(out), (off_t)off) != 0 || fseeko(out, (off_t)off, SEEK_SET) != 0) {
+					fprintf(stderr, "cannot resume %s\n", outf); gs_boinc_finish(1);
+				}
+				k0 = kk; total_out = to; total_drop = td; positions = po; total_trunc = tt; total_bigb = tb;
+				fprintf(stderr, "resuming from checkpoint %s: special-q %zu of %zu, %llu survivors so far\n", ckptf, k0, qs.size(), to);
+			}
+		}
+	}
+	if (!out) {
+		out = fopen(outf, "wb");
+		if (!out) { fprintf(stderr, "cannot write %s\n", outf); gs_boinc_finish(1); }
+		// header: version 1, the side whose factors NFS_factory rebuilds (the other side; NFS_factory checks the sieved one)
+		uint32_t header[4] = {0, 1, (uint32_t)(1 - side), 0}; memcpy(header, "NFAB", 4);
+		if (compact) { memcpy(header, "GSC1", 4); header[3] = (uint32_t)logI; }     // see gsc.h
+		fwrite(header, sizeof header, 1, out);
+	}
+	// flush the output to the disk (fsync fails with EINVAL on /dev/null and pipes: nothing to sync there)
+	auto sync_out = [&]() {
+		if (fflush(out) != 0 || (fsync(fileno(out)) != 0 && errno != EINVAL && errno != EROFS)) {
+			fprintf(stderr, "cannot write %s: %s\n", outf, strerror(errno)); gs_boinc_finish(1);
+		}
+	};
+	auto write_ckpt = [&](size_t knext) {
+		if (!ckptf) return;
+		sync_out();
+		const unsigned long long off = (unsigned long long)ftello(out);
+		const std::string tmp = std::string(ckptf) + ".tmp";
+		FILE* c = fopen(tmp.c_str(), "w");
+		if (!c) { fprintf(stderr, "cannot write the checkpoint %s\n", tmp.c_str()); return; }
+		fprintf(c, "gpusieve-ckpt 1 %llx %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)phash, (unsigned long long)knext, off,
+			total_out, total_drop, positions, total_trunc, total_bigb);
+		fflush(c); fsync(fileno(c)); fclose(c);
+		if (rename(tmp.c_str(), ckptf) != 0) fprintf(stderr, "cannot rename the checkpoint to %s\n", ckptf);
+		gs_boinc_checkpoint_completed();
+	};
+	const unsigned long long positions0 = positions;
 	auto t_loop = std::chrono::steady_clock::now();
 	double next_report = progress_s;
-	if (!qs.empty()) enqueue(0);
-	for (size_t k = 0; k < qs.size(); k++) {
-		if (k + 1 < qs.size()) enqueue(k + 1);
+	const size_t N = qs.size();
+	if (k0 < N) enqueue(k0);
+	for (size_t k = k0; k < N; k++) {
+		if (k + 1 < N) enqueue(k + 1);
 		process(k);
+		gs_boinc_fraction_done((double)(k + 1) / N);
+		if (ckptf && k + 1 < N && gs_boinc_time_to_checkpoint(ckpt_s)) write_ckpt(k + 1);
 		const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_loop).count();
-		if (progress_s > 0 && el >= next_report && k + 1 < qs.size()) {
+		if (progress_s > 0 && el >= next_report && k + 1 < N) {
 			next_report = el + progress_s;
-			const double left = el / (k + 1) * (qs.size() - k - 1);
+			const double left = el / (k + 1 - k0) * (N - k - 1);
 			fprintf(stderr, "q=%llu: %zu of %zu special-q (%.1f %%), %.1f ms per q, %llu survivors (%.1f GB), %dh%02dm left\n",
-				(unsigned long long)qs[k].q, k + 1, qs.size(), 100.0 * (k + 1) / qs.size(), 1000 * el / (k + 1), total_out,
+				(unsigned long long)qs[k].q, k + 1, N, 100.0 * (k + 1) / N, 1000 * el / (k + 1 - k0), total_out,
 				12e-9 * total_out, (int)(left / 3600), (int)fmod(left / 60, 60));
 		}
 	}
-	fclose(out);
+	sync_out();
+	if (fclose(out) != 0) { fprintf(stderr, "cannot write %s\n", outf); gs_boinc_finish(1); }
+	if (ckptf) { remove(ckptf); }
 	double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_loop).count();
+	const size_t ndone = std::max<size_t>(1, N - k0);     // special-q sieved by this run (after a resume: since the checkpoint)
 	fprintf(stderr, "%zu special-q, %.3g positions, %llu survivors (%llu bucket entries dropped) in %.2f s: %.1f ms per q "
 		"(transform %.2f, buckets %.2f, rows %.2f ms; host waited %.1f ms), %.3g positions/s\n", qs.size(), (double)positions,
-		total_out, total_drop, sec, 1000 * sec / qs.size(), t_tr / qs.size(), t_bk / qs.size(), t_rows / qs.size(),
-		1000 * t_wait / qs.size(), positions / sec);
+		total_out, total_drop, sec, 1000 * sec / ndone, t_tr / ndone, t_bk / ndone, t_rows / ndone,
+		1000 * t_wait / ndone, (positions - positions0) / sec);
 	if (total_bigb) fprintf(stderr, "WARNING: %llu survivors with b >= 2^32 were left out (b has 32 bits in .ab files): use smaller special-q or I\n",
 		total_bigb);
 	if (total_trunc) fprintf(stderr, "WARNING: %llu special-q had more than %u survivors (-maxout %g); the rest of their survivors were lost\n",
 		total_trunc, maxout, maxout_m);
-	return 0;
+	gs_boinc_finish(0);
 }
