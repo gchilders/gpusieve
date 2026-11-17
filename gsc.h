@@ -38,12 +38,12 @@ inline uint32_t crc32(const uint8_t* d, size_t n)
 inline void put_varint(std::vector<uint8_t>& o, uint64_t v) { while (v >= 128) { o.push_back((uint8_t)(v | 128)); v >>= 7; } o.push_back((uint8_t)v); }
 inline uint64_t zz(int64_t v) { return ((uint64_t)v << 1) ^ (uint64_t)(v >> 63); }
 inline int64_t unzz(uint64_t v) { return (int64_t)(v >> 1) ^ -(int64_t)(v & 1); }
-// false at the end of the buffer or on an overlong varint
-inline bool get_varint(const uint8_t*& p, const uint8_t* end, uint64_t& v)
+// 1 ok, 0 at the end of the buffer (incomplete), -1 overlong
+inline int get_varint(const uint8_t*& p, const uint8_t* end, uint64_t& v)
 {
 	v = 0;
-	for (int s = 0; s < 64; s += 7) { if (p >= end) return false; const uint8_t c = *p++; v |= (uint64_t)(c & 127) << s; if (!(c & 128)) return true; }
-	return false;
+	for (int s = 0; s < 64; s += 7) { if (p >= end) return 0; const uint8_t c = *p++; v |= (uint64_t)(c & 127) << s; if (!(c & 128)) return 1; }
+	return -1;
 }
 
 struct BitWriter {
@@ -150,24 +150,28 @@ inline void encode_block(std::vector<uint8_t>& o, uint64_t q, uint64_t r, int64_
 
 struct Block { uint64_t q, r; int64_t a0, b0, a1, b1; std::vector<uint64_t> keys; };
 
-// decode the block at p (advanced past it); 0 ok, 1 clean end of data, -1 damaged
-inline int decode_block(const uint8_t*& p, const uint8_t* end, Block& B)
+// decode the block at p; 0 ok (p advanced past it), 1 clean end of data, 2 the data ends inside the block (a stream
+// reader reads more and retries; at the end of a file it is truncated), -1 damaged. p moves only on success.
+inline int decode_block(const uint8_t*& p0, const uint8_t* end, Block& B)
 {
+	const uint8_t* p = p0;
 	if (p == end) return 1;
 	const uint8_t* start = p;
 	uint64_t v[7];
-	for (int t = 0; t < 7; t++) if (!get_varint(p, end, v[t])) return -1;
+	for (int t = 0; t < 7; t++) { const int rc = get_varint(p, end, v[t]); if (rc <= 0) return rc == 0 ? 2 : -1; }
 	B.q = v[0]; B.r = v[1]; B.a0 = unzz(v[2]); B.b0 = unzz(v[3]); B.a1 = unzz(v[4]); B.b1 = unzz(v[5]);
 	const uint64_t n = v[6];
-	if (p >= end) return -1;
+	if (p >= end) return 2;
 	const int k = *p++;
+	if (k > 56) return -1;
 	uint64_t nbytes;
-	if (k > 56 || !get_varint(p, end, nbytes) || nbytes > (uint64_t)(end - p) || (uint64_t)(end - p) - nbytes < 4) return -1;
+	{ const int rc = get_varint(p, end, nbytes); if (rc <= 0) return rc == 0 ? 2 : -1; }
+	if (nbytes > (1ull << 30) || n > nbytes * 8) return -1;     // no block is that large; each code has at least one bit
+	if (nbytes > (uint64_t)(end - p) || (uint64_t)(end - p) - nbytes < 4) return 2;
 	const uint8_t* bits = p; p += nbytes;
 	uint32_t c = 0; for (int t = 0; t < 4; t++) c |= (uint32_t)p[t] << (8 * t);
 	if (crc32(start, p - start) != c) return -1;
 	p += 4;
-	if (n > nbytes * 8) return -1;           // each code has at least one bit
 	B.keys.resize(n);
 	BitReader rd(bits, bits + nbytes);
 	uint64_t key = 0;
@@ -180,6 +184,7 @@ inline int decode_block(const uint8_t*& p, const uint8_t* end, Block& B)
 		key = t ? key + g + 1 : g;
 		B.keys[t] = key;
 	}
+	p0 = p;
 	return 0;
 }
 

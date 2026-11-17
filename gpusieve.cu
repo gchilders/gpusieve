@@ -246,27 +246,6 @@ static uint64_t lin_root(uint64_t m)
 	return (uint64_t)((u128)r * invmod(y1, m) % m);
 }
 
-// primes in [lo, hi) (2 excluded), by a segmented sieve
-static std::vector<uint64_t> primes_in(uint64_t lo, uint64_t hi)
-{
-	std::vector<uint64_t> out;
-	if (hi <= lo) return out;
-	const uint64_t root = (uint64_t)sqrtl((long double)hi) + 2;
-	std::vector<uint8_t> comp(root + 1, 0); std::vector<uint64_t> sp;
-	for (uint64_t p = 2; p <= root; p++) { if (comp[p]) continue; sp.push_back(p); for (uint64_t m = p * p; m <= root; m += p) comp[m] = 1; }
-	const uint64_t W = 1 << 22;
-	std::vector<uint8_t> seg(W);
-	for (uint64_t s = lo; s < hi; s += W) {
-		const uint64_t e = std::min(hi, s + W);
-		std::fill(seg.begin(), seg.end(), 0);
-		for (uint64_t p : sp) {
-			if (p * p >= e) break;
-			for (uint64_t m = std::max(p * p, (s + p - 1) / p * p); m < e; m += p) seg[m - s] = 1;
-		}
-		for (uint64_t x = s; x < e; x++) if (!seg[x - s] && x > 2) out.push_back(x);
-	}
-	return out;
-}
 
 // primes below n (n small: the sieving primes up to sqrt(lim))
 static std::vector<uint32_t> base_primes(uint32_t n)
@@ -276,8 +255,9 @@ static std::vector<uint32_t> base_primes(uint32_t n)
 	return out;
 }
 
-// primes in [lo, hi), lo >= 2, appended to out; base: all primes up to at least sqrt(hi)
-static void seg_primes(uint64_t lo, uint64_t hi, const std::vector<uint32_t>& base, std::vector<uint32_t>& out)
+// primes in [lo, hi), lo >= 2, appended to out (T: uint32_t for the factor base, uint64_t for special-q); base: all primes
+// up to at least sqrt(hi)
+template <typename T> static void seg_primes(uint64_t lo, uint64_t hi, const std::vector<uint32_t>& base, std::vector<T>& out)
 {
 	const uint64_t W = 1 << 20;
 	std::vector<uint8_t> seg(W);
@@ -289,8 +269,17 @@ static void seg_primes(uint64_t lo, uint64_t hi, const std::vector<uint32_t>& ba
 			if (pp >= e) break;
 			for (uint64_t m = std::max(pp, (s + p - 1) / p * p); m < e; m += p) seg[m - s] = 1;
 		}
-		for (uint64_t x = s; x < e; x++) if (!seg[x - s]) out.push_back((uint32_t)x);
+		for (uint64_t x = s; x < e; x++) if (!seg[x - s]) out.push_back((T)x);
 	}
+}
+
+// the odd primes in [lo, hi): the special-q
+static std::vector<uint64_t> primes_in(uint64_t lo, uint64_t hi)
+{
+	std::vector<uint64_t> out;
+	lo = std::max<uint64_t>(lo, 3);
+	if (hi > lo) seg_primes(lo, hi, base_primes((uint32_t)sqrtl((long double)hi) + 2), out);
+	return out;
 }
 
 // body(k) for k = 0 .. n-1 on nthreads threads (blocks of 64 indices)
@@ -857,6 +846,7 @@ int main(int argc, char** argv)
 	if (qfile) qfile = gs_boinc_resolve(qfile);
 	if (boinc) { if (!ckptf) ckptf = "gpusieve.ckpt"; resume = true; }
 	// the CUDA device: the client's assignment, else -device, else 0
+	size_t gpu_total = 0;
 	{
 		const int bd = gs_boinc_gpu_device();
 		if (bd >= 0) device = bd;
@@ -867,6 +857,7 @@ int main(int argc, char** argv)
 		cudaDeviceProp pr; CHECK(cudaGetDeviceProperties(&pr, device));
 		fprintf(stderr, "GPU %d: %s, compute capability %d.%d, %d SMs, %.1f GB\n", device, pr.name, pr.major, pr.minor,
 			pr.multiProcessorCount, pr.totalGlobalMem / 1e9);
+		gpu_total = pr.totalGlobalMem;
 	}
 	Poly P = read_poly(polyf);
 	// the sieved side and the other (linear) side
@@ -991,6 +982,15 @@ int main(int argc, char** argv)
 		return 0;
 	}
 	DevFB fb; fb.n = (int)(nsmall + nlg); fb.nsmall = nsmall; fb.proj = fb.nproj = fb.npart = nullptr; fb.part = nullptr;
+	// GPU memory that does not shrink with more passes: the factor base (p, base, y0, y1, logp, R and each lane's R) and the
+	// two survivor buffers. A GPU without room for it in all can never run this; then fail instead of retrying (an
+	// allocation that fails later, with the room there in all, means other programs hold the memory: a temporary exit).
+	const double fixed_bytes = (21.0 + 4.0 * lanes) * fb.n + 16.0 * std::min<double>(maxout_m * 1048576.0, 4e9);
+	if (fixed_bytes > 0.9 * (double)gpu_total) {
+		fprintf(stderr, "the GPU has %.2f GB; the factor base and survivor buffers alone need %.2f GB (lower -lim or -maxout)\n",
+			gpu_total / 1e9, fixed_bytes / 1e9);
+		gs_boinc_finish(1);
+	}
 	fb.ktiny = (int)(std::find_if(small.begin(), small.end(), [&](const E& e) { return e.p >= tiny; }) - small.begin());
 	med = std::max(med, tiny);
 	// line-sieved large entries: I <= p < line_lim (below 2^20, so that j*R stays far below the float quotient's limits).
@@ -1134,7 +1134,8 @@ int main(int argc, char** argv)
 		if (need > freeb * 0.95) {
 			fprintf(stderr, "not enough GPU memory%s\n", lanes > 1 ? ": try -lanes 1" : nparts_opt > 0 ? ": try a larger -parts" : "");
 			// the factor base itself is already on the GPU; if the GPU as a whole has room, other programs hold the rest: retry later
-			if (need < totalb * 0.85) gs_boinc_temporary_exit(1800, "not enough free GPU memory");
+			// (need counts the survivor buffers and the lanes' R; the factor base's own arrays are 21 bytes per entry)
+			if (need + 21.0 * fb.n < totalb * 0.85) gs_boinc_temporary_exit(1800, "not enough free GPU memory");
 			gs_boinc_finish(1);
 		}
 	}
@@ -1274,14 +1275,17 @@ int main(int argc, char** argv)
 		CHECK(cudaStreamSynchronize(cs));
 		// gcd(i,j) = 1 was checked on the GPU, so gcd(a,b) is 1 or q
 		const int64_t q = (int64_t)Q.q;
-		wbuf.resize((size_t)(n + 1) * 12); char* w = wbuf.data();
+		if (!compact) wbuf.resize((size_t)(n + 1) * 12);
+		char* w = wbuf.data();
 		keys.clear();                   // -compact: the keys j*I + (i + I/2) of the pairs written
+		unsigned int written = 0;       // pairs written (the GPU's survivors less those dropped here)
 		for (unsigned int t = 0; t < n; t++) {
 			const int64_t i = hout[t].i, j = hout[t].j;
 			int64_t a = i * Q.a0 + j * Q.a1, b = i * Q.b0 + j * Q.b1;
 			if (b < 0) { a = -a; b = -b; }
 			if (b >= (1ll << 32)) { total_bigb++; continue; }
 			if (a % q == 0 && b % q == 0) continue;
+			written++;
 			if (compact) { keys.push_back(((uint64_t)j << logI) | (uint64_t)(i + (I >> 1))); continue; }
 			uint32_t b32 = (uint32_t)b; memcpy(w, &a, 8); memcpy(w + 8, &b32, 4); w += 12;
 		}
@@ -1300,7 +1304,7 @@ int main(int argc, char** argv)
 			if (b > 0 && b < (1ll << 32) && g == 1 && dummy_ok && sieved_ok) {
 				if (compact) keys.push_back((uint64_t)(1 + (I >> 1)));    // (i,j) = (1,0)
 				else { uint32_t b32 = (uint32_t)b; memcpy(w, &a, 8); memcpy(w + 8, &b32, 4); w += 12; }
-				n++;
+				written++;
 			}
 		}
 		if (compact) {
@@ -1309,9 +1313,9 @@ int main(int argc, char** argv)
 			gsc::encode_block(cbuf, Q.q, Q.r, Q.a0, Q.b0, Q.a1, Q.b1, keys);
 			fwrite(cbuf.data(), 1, cbuf.size(), out);
 		} else fwrite(wbuf.data(), 1, w - wbuf.data(), out);
-		total_out += n; total_drop += dr; positions += (uint64_t)I * (Q.J - 1);
+		total_out += written; total_drop += dr; positions += (uint64_t)I * (Q.J - 1);
 		if (verbose) fprintf(stderr, "q=%llu J=%u: %u survivors, %llu bucket entries dropped, %u pass%s, %.2f + %.2f + %.2f ms\n",
-			(unsigned long long)Q.q, Q.J, n, dr, s.used, s.used > 1 ? "es" : "", ms1, ms2, ms3);
+			(unsigned long long)Q.q, Q.J, written, dr, s.used, s.used > 1 ? "es" : "", ms1, ms2, ms3);
 	};
 
 	// the host stays up to two special-q ahead of the one it writes (output slot (k+2)&1 = k&1 is free only after process(k))
@@ -1366,17 +1370,25 @@ int main(int argc, char** argv)
 			fprintf(stderr, "cannot write %s: %s\n", outf, strerror(errno)); gs_boinc_finish(1);
 		}
 	};
+	// A checkpoint that cannot be written completely is dropped (the previous one stays); either way the client is told
+	// that the checkpoint is over, which also ends the critical section boinc_time_to_checkpoint() entered.
 	auto write_ckpt = [&](size_t knext) {
 		if (!ckptf) return;
 		sync_out();
 		const unsigned long long off = (unsigned long long)ftello(out);
 		const std::string tmp = std::string(ckptf) + ".tmp";
-		FILE* c = fopen(tmp.c_str(), "w");
-		if (!c) { fprintf(stderr, "cannot write the checkpoint %s\n", tmp.c_str()); return; }
-		fprintf(c, "gpusieve-ckpt 1 %llx %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)phash, (unsigned long long)knext, off,
-			total_out, total_drop, positions, total_trunc, total_bigb);
-		fflush(c); fsync(fileno(c)); fclose(c);
-		if (rename(tmp.c_str(), ckptf) != 0) fprintf(stderr, "cannot rename the checkpoint to %s\n", ckptf);
+		bool ok = false;
+		if (FILE* c = fopen(tmp.c_str(), "w")) {
+			ok = fprintf(c, "gpusieve-ckpt 1 %llx %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)phash,
+			             (unsigned long long)knext, off, total_out, total_drop, positions, total_trunc, total_bigb) > 0;
+			ok = fflush(c) == 0 && ok;
+			ok = fsync(fileno(c)) == 0 && ok;
+			ok = fclose(c) == 0 && ok;
+		}
+		if (!ok || rename(tmp.c_str(), ckptf) != 0) {
+			fprintf(stderr, "cannot write the checkpoint %s (%s); keeping the previous one\n", ckptf, strerror(errno));
+			remove(tmp.c_str());
+		}
 		gs_boinc_checkpoint_completed();
 	};
 	const unsigned long long positions0 = positions;

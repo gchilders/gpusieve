@@ -254,7 +254,8 @@ gsc2ab -o - part.gsc | NFS_factory_gpu check.poly - part.txt
 gsc2ab -info part.gsc        special-q blocks, first and last special-q, pairs, bits per pair
 ```
 
-A damaged or truncated file stops gsc2ab with exit status 2, naming the last good special-q.
+gsc2ab reads its inputs as streams and checks every block. A damaged or truncated file stops it with exit status 2, naming
+the last good special-q, and leaves no output file (the output is written to `out.ab.part` and renamed at the end).
 
 ## Checkpoints
 

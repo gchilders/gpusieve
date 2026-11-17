@@ -7,6 +7,16 @@
 #include <string>
 #include <deque>
 
+// a checkpoint every standalone_s seconds, for runs without a client
+static bool standalone_checkpoint_due(double standalone_s)
+{
+	static auto last = std::chrono::steady_clock::now();
+	const auto now = std::chrono::steady_clock::now();
+	if (std::chrono::duration<double>(now - last).count() < standalone_s) return false;
+	last = now;
+	return true;
+}
+
 #ifdef HAVE_BOINC
 #include "boinc_api.h"
 
@@ -77,14 +87,10 @@ void gs_boinc_fraction_done(double f)
 bool gs_boinc_time_to_checkpoint(double standalone_s)
 {
 	if (gs_boinc_managed()) return boinc_time_to_checkpoint() != 0;
-	static auto last = std::chrono::steady_clock::now();
-	auto now = std::chrono::steady_clock::now();
-	if (std::chrono::duration<double>(now - last).count() < standalone_s) return false;
-	last = now;
-	return true;
+	return standalone_checkpoint_due(standalone_s);
 }
 
-void gs_boinc_checkpoint_completed() { if (g_up) boinc_checkpoint_completed(); }
+void gs_boinc_checkpoint_completed() { if (gs_boinc_managed()) boinc_checkpoint_completed(); }   // pairs with boinc_time_to_checkpoint()
 
 void gs_boinc_temporary_exit(int delay_s, const char* reason)
 {
@@ -112,14 +118,7 @@ int gs_boinc_gpu_device() { return -1; }
 double gs_boinc_ncpus() { return 0; }
 const char* gs_boinc_resolve(const char* logical) { return logical; }
 void gs_boinc_fraction_done(double) {}
-bool gs_boinc_time_to_checkpoint(double standalone_s)
-{
-	static auto last = std::chrono::steady_clock::now();
-	auto now = std::chrono::steady_clock::now();
-	if (std::chrono::duration<double>(now - last).count() < standalone_s) return false;
-	last = now;
-	return true;
-}
+bool gs_boinc_time_to_checkpoint(double standalone_s) { return standalone_checkpoint_due(standalone_s); }
 void gs_boinc_checkpoint_completed() {}
 void gs_boinc_temporary_exit(int, const char*) {}
 void gs_boinc_finish(int status) { fflush(stderr); fflush(stdout); exit(status); }
