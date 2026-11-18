@@ -175,6 +175,23 @@ mode, with `-lim` below `2^lpb` and `-mfb 2*lpb`, writes 15-20 times as many sur
 `-I 16` and `-I 17` are the usual choices; up to `-I 19` works. A larger `-I` needs no larger GPU: gpusieve sieves a
 special-q in as many passes as needed (see [GPU memory](#gpu-memory)).
 
+### Enlarging the sieve region
+
+`-I A-B` sieves only the part of the `-I B` region that a run with `-I A` did not cover. After a store was sieved with
+`-I 17`, a run with `-I 17-18` over the same special-q adds the rest of the `-I 18` region, and the two outputs together
+are the pairs of an `-I 18` run. Use the same poly file (its skew and both sides set the region) and the same special-q
+range; the steps can be chained (`-I 16-17`, then `-I 17-18`).
+
+The lattice basis of a special-q does not depend on `-I`, so the `-I A` region (`|i| < 2^(A-1)`, `j` below its own `J`)
+lies inside the `-I B` one. gpusieve leaves out the large primes' bucket entries in that part, and with `A` of 16 or
+more it skips its bucket regions (32768 columns of a row) altogether; with a smaller `A` the regions are still sieved
+and only their points inside are left out. The run takes about as much less time as the `-I A` run took: on a Titan V,
+x - 10^64 near q = 10^7 with lim `2^28`, `-I 17` took 663 ms per special-q, `-I 16` 171 ms and `-I 16-17` 511 ms.
+Together the two runs give the pairs of `-I B` except a few in the inner part that the `-I A` run missed: those whose
+value is divisible by a prime power (or, on an algebraic side, has a projective root) between `2^A` and `2^B`, which
+only the larger region sieves. `-I 18` and `-I 18-19` on x - 10^64 at lim `2^32` missed 20 of the 1,191,249 pairs of
+`-I 19` (all divisible by such a prime power, for example `547^2`); at degree 7, 0.02-0.06 % of the pairs.
+
 **Special-q range.** Small special-q give the smallest pairs, which are the most useful ones, but more duplicates and
 many survivors per special-q (raise `-maxout` if the run reports dropped survivors). `-random N` sieves N random
 special-q of the range, to estimate the yield before a long run.
@@ -189,6 +206,7 @@ counts as a large prime there. Then use a lim of at least the largest special-q 
 | `-poly FILE` | CADO-NFS poly file | |
 | `-side 0\|1` | side to sieve | algebraic if its degree is 2 or more, else rational |
 | `-I N` | sieve region of `2^N` by up to `2^(N-1)`, N from 10 to 19 | 15 |
+| `-I A-B` | the part of the `-I B` region that a run with `-I A` did not cover (see [Enlarging the sieve region](#enlarging-the-sieve-region)) | |
 | `-parts N` | sieve each special-q in N passes over its rows, N a power of 2 | as few as fit into the GPU's memory and L2 cache |
 | `-lim L` | factor base bound (below `2^32`) | 25000000 |
 | `-mfb B` | bits of the value allowed beyond the factor base | 56 |
@@ -197,8 +215,8 @@ counts as a large prime there. Then use a lim of at least the largest special-q 
 | `-random N` | only N random special-q of the range | |
 | `-qfile FILE` | special-q, basis and J from las output (`# Sieving side-S q=...` lines), for comparisons with las | |
 | `-out FILE` | output `.ab` file | |
-| `-dummybits B` | a dummy side's values must stay below `2^B`; 0: not checked | 32 |
-| `-maxout M` | at most `M * 2^20` survivors per special-q (32 MB of GPU and 32 MB of host memory per unit); more are counted and reported | 16 |
+| `-dummybits B` | the other side's values must stay below `2^B` (0: not checked). `32` gives the pairs of las with lpb = mfb = 32 on a dummy side, for comparisons with las; for a factory it only drops pairs of large \|a\| (with `2x - 1`: \|2a - b\| of `2^32` or more) | 0 |
+| `-maxout M` | at most `M * 2^20` survivors per special-q (16 MB of GPU and up to 20 MB of host memory per unit); more are counted and reported | 16 |
 | `-threads N` | host threads for the factor base and the special-q roots | 16 |
 | `-progress S` | a progress line every S seconds, 0 for none | 60 |
 | `-v` | timings of each special-q | |
@@ -208,7 +226,7 @@ counts as a large prime there. Then use a lim of at least the largest special-q 
 | `-device N` | the CUDA device (under BOINC the client's assignment wins) | 0 |
 
 Tuning options, rarely needed: `-tiny P` (primes below P are sieved by all threads of a region, default 64), `-med M`
-(primes from P to M are sieved by one warp each, default 1024), `-line L` (primes from I to L, at most 2^20, are
+(primes from P to M are sieved by one warp each, default 2048), `-line L` (primes from I to L, at most 2^20, are
 sieved row by row instead of through the buckets; default 2^17 for I up to 16, 0 for larger I),
 `-lanes 2` (fill the buckets of the next special-q while the rows of this one are sieved), `-bblocks N` and
 `-rblocks N` (persistent grids for the two kernels), `-twopass` (another bucket kernel), and `-dumpfb FILE` (write the
@@ -236,8 +254,9 @@ in the GPU's L2 cache, which makes the bucket fill faster. With a 4.5 MB L2, 16 
 as 2; with a 96 MB L2, 4 passes at `-I 17` were 1.25 times as fast as 1. Each further pass costs about 1 ms per
 special-q. `-parts N` sets N.
 
-Besides one pass' buckets, the GPU holds the factor base (about 30 bytes per entry, 0.4 GB at lim `2^28` on a rational
-side, 0.8 GB at lim `2^29` on a side of degree 7) and two output buffers (32 MB per `-maxout` unit, 512 MB by default).
+Besides one pass' buckets, the GPU holds the factor base (25 bytes per entry with several passes, 17 with one: 0.4 GB
+at lim `2^28` on a rational side, 2.6 GB at lim `2^31`, 5.1 GB at lim `2^32`) and two output buffers (16 MB per `-maxout`
+unit, 256 MB by default). So `-I 18` at lim `2^32` (32-bit large primes) needs 6 to 7 GB and runs on 8 GB GPUs.
 At startup gpusieve prints the number of passes and the memory it needs, and stops if the GPU does not have it.
 
 ## Compact output
