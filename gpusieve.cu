@@ -35,10 +35,9 @@
 #include <thread>
 #include <atomic>
 #include <functional>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <cuda_runtime.h>
 #include "boinc_glue.h"
+#include "gs_port.h"
 #include "gsc.h"
 
 // CUDA errors: those that a later attempt on the same host can get past (no device or out of memory while other programs
@@ -58,8 +57,7 @@
 }
 #define CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) cuda_fail(e_, __FILE__, __LINE__); } while (0)
 
-typedef unsigned __int128 u128;
-typedef __int128 i128;
+typedef gs_i128 i128;
 #define MAXD 8                  // largest degree of the sieved polynomial
 
 struct Poly {
@@ -103,7 +101,7 @@ static uint64_t mod_str(const std::string& s, uint64_t m)
 	for (char ch : s) {
 		if (ch == '-') { neg = true; continue; }
 		if (ch < '0' || ch > '9') continue;
-		r = small ? (r * 10 + (uint64_t)(ch - '0')) % m : (uint64_t)(((u128)r * 10 + (uint64_t)(ch - '0')) % m);
+		r = small ? (r * 10 + (uint64_t)(ch - '0')) % m : gs_muladdmod(r, 10, (uint64_t)(ch - '0'), m);
 	}
 	return neg ? (r ? m - r : 0) : r;
 }
@@ -122,7 +120,7 @@ static std::vector<std::string> g_spoly;
 struct FPol { int deg = -1; uint64_t c[2 * MAXD + 1]; };     // coefficients low to high; deg -1: the zero polynomial
 struct Fp {
 	uint64_t p;
-	uint64_t mul(uint64_t a, uint64_t b) const { return p < (1ull << 32) ? a * b % p : (uint64_t)((u128)a * b % p); }
+	uint64_t mul(uint64_t a, uint64_t b) const { return p < (1ull << 32) ? a * b % p : gs_muladdmod(a, b, 0, p); }
 	uint64_t add(uint64_t a, uint64_t b) const { uint64_t s = a + b; return s >= p ? s - p : s; }
 	uint64_t sub(uint64_t a, uint64_t b) const { return a >= b ? a - b : a + (p - b); }
 	void trim(FPol& f) const { while (f.deg >= 0 && f.c[f.deg] == 0) f.deg--; }
@@ -151,7 +149,7 @@ struct Fp {
 	FPol powmod(const FPol& b, uint64_t e, const FPol& m) const {
 		FPol r; r.deg = 0; r.c[0] = 1;
 		if (m.deg == 0) { r.deg = -1; return r; }
-		for (int bit = 63 - __builtin_clzll(e); bit >= 0; bit--) { r = mulmod(r, r, m); if (e >> bit & 1) r = mulmod(r, b, m); }
+		for (int bit = 63 - gsc::clz64(e); bit >= 0; bit--) { r = mulmod(r, r, m); if (e >> bit & 1) r = mulmod(r, b, m); }
 		return r;
 	}
 	FPol gcd(FPol a, FPol b) const {
@@ -246,7 +244,7 @@ static uint64_t lin_root(uint64_t m)
 {
 	uint64_t y0 = mod_str(g_spoly[0], m), y1 = mod_str(g_spoly[1], m);
 	uint64_t r = y0 ? m - y0 : 0;
-	return (uint64_t)((u128)r * invmod(y1, m) % m);
+	return m < (1ull << 32) ? r * invmod(y1, m) % m : gs_muladdmod(r, invmod(y1, m), 0, m);   // r, inverse < m
 }
 
 
@@ -386,6 +384,16 @@ template <typename T> static std::vector<T> homography(const std::vector<T>& c, 
 	for (int m = 0; m <= d; m++)
 		for (int x = 0; x <= m; x++) for (int y = 0; y <= d - m; y++) r[x + y] += c[m] * A[m][x] * B[d - m][y];
 	return r;
+}
+
+// reduce_q works with the quadratic form (a^2 + s^2 b^2) * 2^-ex in 128 bits: its values start below about
+// q^2 * 2^(53 - log2 s^2) and only shrink, and the reduction needs 3 bits above them. False if that does not fit (a skew
+// far below 1 with special-q near 2^32, e.g. s 0.02 with q 2^31), where the reduction would silently give a wrong basis.
+static bool reduce_q_fits(uint64_t qmax, double skew)
+{
+	int ex; frexp(skew * skew, &ex); ex -= 53;
+	const double bits = 2 * log2((double)qmax + 1) + (ex < 0 ? -ex : 0) + (ex > 0 ? ex + 53 : 0);
+	return bits <= 124;
 }
 
 // CADO generic_skew_gauss (quadratic form a^2 + s^2 b^2 with s^2 = mz * 2^ex) followed by sieve_info_adjust_IJ (strategy 0).
@@ -1160,10 +1168,11 @@ int main(int argc, char** argv)
 			if (sscanf(line, "# Sieving side-%d q=%llu; rho=%llu; a0=%lld; b0=%lld; a1=%lld; b1=%lld; I=%u; J=%u;",
 			           &sqside, &q, &r, &a0, &b0, &a1, &b1, &Ii, &J) == 9) {
 				if (sqside != side) { nother++; continue; }
+				if (!reduce_q_fits(q, P.skew)) { fprintf(stderr, "%s: special-q %llu is too large for skew %g (the lattice reduction would overflow)\n", qfile, q, P.skew); return 1; }
 				if (!qs.empty() && std::any_of(qs.begin(), qs.end(), [&](const QLattice& x) { return x.q == q && x.r == r; })) continue;   // las repeats a q after bucket resizing
 				if (poly_norm) {
 					uint64_t fq[MAXD + 1], v = 0; spoly_mod(q, fq);
-					for (int k = sdeg; k >= 0; k--) v = (uint64_t)(((u128)v * r + fq[k]) % q);
+					for (int k = sdeg; k >= 0; k--) v = gs_muladdmod(v, r, fq[k], q);
 					if (v != 0) { fprintf(stderr, "%s: rho=%llu is not a root modulo q=%llu of side %d\n", qfile, r, q, side); return 1; }
 				}
 				qs.push_back({q, r, a0, b0, a1, b1, J});
@@ -1196,6 +1205,12 @@ int main(int argc, char** argv)
 				done += n;
 			}
 			std::sort(qr.begin(), qr.end());
+		}
+		uint64_t qmax = 0; for (const auto& x : qr) qmax = std::max(qmax, x.first);
+		if (!reduce_q_fits(qmax, P.skew)) {
+			fprintf(stderr, "special-q up to %llu are too large for skew %g (the lattice reduction would overflow): use a larger skew\n",
+			        (unsigned long long)qmax, P.skew);
+			return 1;
 		}
 		qs.resize(qr.size());
 		std::atomic<long> basis_diff{0};
@@ -1486,13 +1501,13 @@ int main(int argc, char** argv)
 			unsigned long long h = 0, kk = 0, off = 0, to = 0, td = 0, po = 0, tt = 0, tb = 0;
 			const int got = fscanf(c, "gpusieve-ckpt 1 %llx %llu %llu %llu %llu %llu %llu %llu", &h, &kk, &off, &to, &td, &po, &tt, &tb);
 			fclose(c);
-			struct stat st;
+			uint64_t outsize = 0;
 			if (got != 8 || h != phash || kk > qs.size()) fprintf(stderr, "checkpoint %s: not for this run, starting over\n", ckptf);
-			else if (stat(outf, &st) != 0 || (unsigned long long)st.st_size < off)
+			else if (!gs_file_size(outf, outsize) || outsize < off)
 				fprintf(stderr, "checkpoint %s: the output %s is shorter than recorded, starting over\n", ckptf, outf);
 			else {
 				out = fopen(outf, "r+b");
-				if (!out || ftruncate(fileno(out), (off_t)off) != 0 || fseeko(out, (off_t)off, SEEK_SET) != 0) {
+				if (!out || gs_ftruncate(out, (int64_t)off) != 0 || gs_fseek(out, (int64_t)off) != 0) {
 					fprintf(stderr, "cannot resume %s\n", outf); gs_boinc_finish(1);
 				}
 				k0 = kk; total_out = to; total_drop = td; positions = po; total_trunc = tt; total_bigb = tb;
@@ -1510,7 +1525,7 @@ int main(int argc, char** argv)
 	}
 	// flush the output to the disk (fsync fails with EINVAL on /dev/null and pipes: nothing to sync there)
 	auto sync_out = [&]() {
-		if (fflush(out) != 0 || (fsync(fileno(out)) != 0 && errno != EINVAL && errno != EROFS)) {
+		if (fflush(out) != 0 || (gs_fsync(out) != 0 && errno != EINVAL && errno != EROFS)) {
 			fprintf(stderr, "cannot write %s: %s\n", outf, strerror(errno)); gs_boinc_finish(1);
 		}
 	};
@@ -1519,17 +1534,17 @@ int main(int argc, char** argv)
 	auto write_ckpt = [&](size_t knext) {
 		if (!ckptf) return;
 		sync_out();
-		const unsigned long long off = (unsigned long long)ftello(out);
+		const unsigned long long off = (unsigned long long)gs_ftell(out);
 		const std::string tmp = std::string(ckptf) + ".tmp";
 		bool ok = false;
 		if (FILE* c = fopen(tmp.c_str(), "w")) {
 			ok = fprintf(c, "gpusieve-ckpt 1 %llx %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)phash,
 			             (unsigned long long)knext, off, total_out, total_drop, positions, total_trunc, total_bigb) > 0;
 			ok = fflush(c) == 0 && ok;
-			ok = fsync(fileno(c)) == 0 && ok;
+			ok = gs_fsync(c) == 0 && ok;
 			ok = fclose(c) == 0 && ok;
 		}
-		if (!ok || rename(tmp.c_str(), ckptf) != 0) {
+		if (!ok || gs_replace_file(tmp.c_str(), ckptf) != 0) {
 			fprintf(stderr, "cannot write the checkpoint %s (%s); keeping the previous one\n", ckptf, strerror(errno));
 			remove(tmp.c_str());
 		}

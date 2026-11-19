@@ -301,7 +301,14 @@ GLIBC_2.17 symbols), for compute capabilities 5.0 to 12.0 with PTX for 8.0 (Rock
 make gpusieve HAVE_BOINC=1 BOINC_DIR=/path/to/boinc CUDA_ARCH="50 52 60 61 70 75 80 86 89 90 100 120" CUDA_PTX=80
 ```
 
-libstdc++, libgcc and the CUDA runtime are linked statically. Under a BOINC client gpusieve
+libstdc++, libgcc and the CUDA runtime are linked statically.
+
+On Windows, `build-windows.bat` builds `gpusieve.exe` with MSVC and the CUDA Toolkit (from an x64 Native Tools Command
+Prompt), against a BOINC tree whose `win_build` solution has been built (x64 Release; set `BOINC`). MSVC has no
+`__int128`, so `gs_port.h` uses portable 128-bit code there; `make NVCC="nvcc -DGS_NO_INT128"` builds the same code on
+Linux, whose output is identical.
+
+Under a BOINC client gpusieve
 
 - takes its GPU from `init_data.xml` (`gpu_device_num`), else `--device N`;
 - resolves the logical names of `-poly`, `-out` and `-qfile`;

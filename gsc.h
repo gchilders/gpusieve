@@ -19,8 +19,23 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#ifdef _MSC_VER
+#include <intrin.h>     // _BitScanReverse64
+#endif
 
 namespace gsc {
+
+// leading zero bits of v != 0 (MSVC has no __builtin_clzll)
+inline int clz64(uint64_t v)
+{
+#ifdef _MSC_VER
+	unsigned long i;
+	_BitScanReverse64(&i, v);
+	return 63 - (int)i;
+#else
+	return __builtin_clzll(v);
+#endif
+}
 
 inline uint32_t crc32(const uint8_t* d, size_t n)
 {
@@ -71,7 +86,7 @@ struct BitReader {
 
 inline void put_gamma(BitWriter& w, uint64_t v)      // v >= 1
 {
-	int L = 63 - __builtin_clzll(v);
+	int L = 63 - clz64(v);
 	for (int t = 0; t < L; t++) w.put(0, 1);
 	for (int t = L; t >= 0; t--) w.put(v >> t & 1, 1);
 }
@@ -88,13 +103,13 @@ inline uint64_t get_gamma(BitReader& r)
 inline int best_k(const std::vector<uint64_t>& gaps)
 {
 	if (gaps.empty()) return 0;
-	unsigned __int128 sum = 0; for (uint64_t g : gaps) sum += g;
+	uint64_t sum = 0; for (uint64_t g : gaps) sum += g;   // at most the last key: no overflow
 	const double mean = (double)sum / gaps.size();
 	int k0 = mean > 1 ? (int)(log2(mean)) : 0;
 	int best = 0; uint64_t bestbits = ~0ull;
 	for (int k = std::max(0, k0 - 2); k <= std::min(56, k0 + 2); k++) {
 		uint64_t bits = 0;
-		for (uint64_t g : gaps) { const uint64_t q = g >> k; bits += k + (q < 32 ? q + 1 : 32 + 2 * (64 - __builtin_clzll(q - 31)) - 1); }
+		for (uint64_t g : gaps) { const uint64_t q = g >> k; bits += k + (q < 32 ? q + 1 : 32 + 2 * (64 - clz64(q - 31)) - 1); }
 		if (bits < bestbits) { bestbits = bits; best = k; }
 	}
 	return best;
@@ -107,7 +122,7 @@ inline void sort_keys(std::vector<uint64_t>& keys, std::vector<uint64_t>& tmp)
 	const size_t n = keys.size();
 	if (n < 65536) { std::sort(keys.begin(), keys.end()); return; }
 	uint64_t mx = 0; for (uint64_t k : keys) mx |= k;
-	const int bits = mx ? 64 - __builtin_clzll(mx) : 1;
+	const int bits = mx ? 64 - clz64(mx) : 1;
 	tmp.resize(n);
 	std::vector<size_t> cnt(1 << 13);
 	for (int sh = 0; sh < bits; sh += 13) {

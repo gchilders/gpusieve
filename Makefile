@@ -68,7 +68,7 @@ GLUE_OBJ = boinc_glue$(if $(filter 1,$(HAVE_BOINC)),_boinc).o
 $(GLUE_OBJ): boinc_glue.cpp boinc_glue.h Makefile
 	$(CXX) -std=c++17 $(OPT) $(GLUE_FLAGS) -c -o $@ $<
 
-gpusieve: gpusieve.cu gsc.h $(GLUE_OBJ) boinc_glue.h
+gpusieve: gpusieve.cu gsc.h gs_port.h $(GLUE_OBJ) boinc_glue.h
 	$(NVCC) $(NVCCFLAGS) -o $@ gpusieve.cu $(GLUE_OBJ) $(GS_LIBS)
 
 absort: absort.cpp

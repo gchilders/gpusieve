@@ -23,3 +23,5 @@ void gs_boinc_checkpoint_completed();
 void gs_boinc_temporary_exit(int delay_s, const char* reason);
 // end of the run: boinc_finish(status) when the API is up, else exit(status). Does not return.
 [[noreturn]] void gs_boinc_finish(int status);
+// rename `from` to `to`, replacing `to` if it exists (rename() does not on Windows); 0 on success, else errno is set
+int gs_replace_file(const char* from, const char* to);

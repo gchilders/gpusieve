@@ -6,6 +6,36 @@
 #include <chrono>
 #include <string>
 #include <deque>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <cerrno>
+#endif
+
+// On Windows a virus scanner or the search indexer can hold a freshly written file open for a moment, so a sharing or
+// access violation is retried for up to about 5 s (as boinc_rename does); errno is set from the last error.
+int gs_replace_file(const char* from, const char* to)
+{
+#ifdef _WIN32
+	DWORD err = 0;
+	for (int attempt = 0; attempt < 10; attempt++) {
+		if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+		err = GetLastError();
+		if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION && err != ERROR_ACCESS_DENIED) break;
+		Sleep(100 + 50 * attempt);
+	}
+	switch (err) {
+	case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: errno = ENOENT; break;
+	case ERROR_DISK_FULL: case ERROR_HANDLE_DISK_FULL: errno = ENOSPC; break;
+	case ERROR_SHARING_VIOLATION: case ERROR_LOCK_VIOLATION: case ERROR_ACCESS_DENIED: errno = EACCES; break;
+	default: errno = EIO; break;
+	}
+	return -1;
+#else
+	return rename(from, to);
+#endif
+}
 
 // a checkpoint every standalone_s seconds, for runs without a client
 static bool standalone_checkpoint_due(double standalone_s)
