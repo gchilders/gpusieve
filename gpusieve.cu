@@ -506,6 +506,10 @@ __device__ __forceinline__ uint32_t mulmod32(uint32_t a, uint32_t b, uint32_t p,
 	if (r < 0) r += p;
 	return (uint32_t)r;
 }
+__device__ __forceinline__ uint32_t addmod32(uint32_t a, uint32_t b, uint32_t p)   // a + b mod p for a, b < p < 2^32
+{
+	return a >= p - b ? a - (p - b) : a + b;    // a + b itself can exceed 2^32 when p > 2^31
+}
 __device__ __forceinline__ uint32_t smod32(int32_t x, uint32_t p)       // x mod p in [0, p)
 {
 	return x >= 0 ? (uint32_t)x % p : (p - (uint32_t)(-(int64_t)x) % p) % p;
@@ -540,11 +544,9 @@ __global__ void k_transform(DevFB fb, uint64_t q, int64_t a0, int64_t b0, int64_
 		const uint32_t y0 = fb.y0[k], y1 = fb.y1[k];
 		if (p == q || ((uint32_t)q % p == 0 && k < fb.nsmall)) { fb.R[k] = R_SKIP; return; }
 		const float invp = __frcp_rn((float)p);
-		uint32_t A = mulmod32(y1, smod32((int32_t)a0, p), p, invp) + mulmod32(y0, smod32((int32_t)b0, p), p, invp);
-		if (A >= p) A -= p;
+		const uint32_t A = addmod32(mulmod32(y1, smod32((int32_t)a0, p), p, invp), mulmod32(y0, smod32((int32_t)b0, p), p, invp), p);
 		if (A == 0) atomicAdd(row0, (uint32_t)fb.logp[k]);
-		uint32_t B = mulmod32(y1, smod32((int32_t)a1, p), p, invp) + mulmod32(y0, smod32((int32_t)b1, p), p, invp);
-		if (B >= p) B -= p;
+		const uint32_t B = addmod32(mulmod32(y1, smod32((int32_t)a1, p), p, invp), mulmod32(y0, smod32((int32_t)b1, p), p, invp), p);
 		if (A == 0) {
 			if (k < fb.nsmall && B % fb.base[k] != 0) { fb.R[k] = R_PROJ; fb.proj[atomicAdd(fb.nproj, 1u)] = k; }
 			else fb.R[k] = R_SKIP;
