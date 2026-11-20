@@ -20,6 +20,8 @@
 //   free GPU memory), with the buckets of one pass at a time
 //   -I A-B (A < B): the part of the -I B region that a run with -I A (same poly file and special-q) did not cover, to
 //   enlarge the region of special-q sieved before
+//   -skip 0..3: no bucket entries (and in even rows no small-prime hits) at points whose i and j share 2, 3, 5 or 7,
+//   which are never written (default 3; the output is the same at every level). -noscale: see lscale below.
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -35,6 +37,7 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <type_traits>
 #include <cuda_runtime.h>
 #include "boinc_glue.h"
 #include "gs_port.h"
@@ -283,12 +286,12 @@ static std::vector<uint64_t> primes_in(uint64_t lo, uint64_t hi)
 	return out;
 }
 
-// body(k) for k = 0 .. n-1 on nthreads threads (blocks of 64 indices)
-static void parallel_for(size_t n, int nthreads, const std::function<void(size_t)>& body)
+// body(k) for k = 0 .. n-1 on nthreads threads (blocks of `grain` indices)
+static void parallel_for(size_t n, int nthreads, const std::function<void(size_t)>& body, size_t grain = 64)
 {
-	nthreads = (int)std::max<size_t>(1, std::min<size_t>(nthreads, (n + 63) / 64));
+	nthreads = (int)std::max<size_t>(1, std::min<size_t>(nthreads, (n + grain - 1) / grain));
 	std::atomic<size_t> next{0};
-	auto work = [&]() { for (;;) { size_t s = next.fetch_add(64); if (s >= n) break; for (size_t k = s; k < std::min(n, s + 64); k++) body(k); } };
+	auto work = [&]() { for (;;) { size_t s = next.fetch_add(grain); if (s >= n) break; for (size_t k = s; k < std::min(n, s + grain); k++) body(k); } };
 	std::vector<std::thread> th;
 	for (int t = 1; t < nthreads; t++) th.emplace_back(work);
 	work();
@@ -297,7 +300,8 @@ static void parallel_for(size_t n, int nthreads, const std::function<void(size_t
 
 // Jin: with -I A-B, the J of the inner region (that of -I A); the basis does not depend on I, so the inner region is
 // -2^(A-1) <= i < 2^(A-1), 0 <= j < Jin of this lattice
-struct QLattice { uint64_t q, r; int64_t a0, b0, a1, b1; uint32_t J; uint32_t Jin = 0; };
+// lmax: log2 of the largest |F(a,b)/q| of the sieved side over the region (sizes the log scale of the sieve bytes)
+struct QLattice { uint64_t q, r; int64_t a0, b0, a1, b1; uint32_t J; uint32_t Jin = 0; double lmax = 0; };
 
 // ---------------------------------------------------------------- las' choice of J
 // F(a,b) = sum c[k] a^k b^(d-k) of one side as doubles; sq: the special-q side (norms divided by q)
@@ -440,6 +444,7 @@ static QLattice reduce_q(uint64_t q, uint64_t r, double skew, int logI)
 	const double fudge = 2.0, Id = (double)(1u << logI), qd = (double)q;
 	const double Aw = Id * sqrt(qd * skew), Bw = (double)(1u << (logI - 1)) * sqrt(qd / skew);
 	double Jmax = (double)(1u << (logI - 1));
+	std::function<double(double)> vsq;               // the sieved side's largest |value/q| for a J
 	for (const Side& S : g_sides) {
 		double X = fudge * Aw / 2, Y = fudge * Bw;
 		std::function<double(double)> v;
@@ -457,6 +462,7 @@ static QLattice reduce_q(uint64_t q, uint64_t r, double skew, int logI)
 			RectNorm R(fij);
 			v = [=](double J) { return R(Id / 2, J); };
 		}
+		if (S.sq) vsq = v;
 		if (v(Jmax) > maxnorm) {
 			double a = 0, b = Jmax;
 			while (trunc(a) != trunc(b)) { double c = (a + b) * 0.5; if (v(c) < maxnorm) a = c; else b = c; }
@@ -467,6 +473,7 @@ static QLattice reduce_q(uint64_t q, uint64_t r, double skew, int logI)
 	uint32_t lines = 1u << std::max(16 - logI, 0);       // LOG_BUCKET_REGION = 16: round down to whole bucket regions
 	J = (J / lines) * lines;
 	L.J = J;
+	if (vsq) L.lmax = log2(std::max(vsq((double)J), 1.0));
 	return L;
 }
 
@@ -487,6 +494,22 @@ struct DevFB {
 #endif
 #define R_SKIP 0xffffffffu      // no hits in the sieve region (p == q, vertical line, ...)
 #define R_PROJ 0xfffffffeu      // projective: p divides every value of the rows j = 0 (mod p)
+
+// Points whose (i,j) have a common factor are never written (the survivor test drops them), so with -skip their bucket
+// entries are not written either: the bucket fill is bound by L2 transactions (an atomic and a scattered store per entry),
+// and a quarter of all points have i and j even, 1/12 more 3 | gcd, about 4 % more 5 or 7 | gcd. x = i + I/2 with I/2
+// even, so i = x (mod 2); (I/2) mod 3, 5, 7 are h3, h5, h7. Level 1: 2, 2: and 3, 3: and 5, 7.
+struct SkipC { int level; uint32_t h3, h5, h7; };
+__host__ __device__ inline SkipC make_skip(int level, uint32_t I) { return SkipC{level, (I >> 1) % 3u, (I >> 1) % 5u, (I >> 1) % 7u}; }
+__device__ __forceinline__ bool skip_pt(const SkipC& s, uint32_t x, uint32_t j)
+{
+	if (s.level <= 0) return false;
+	if (((x | j) & 1u) == 0) return true;
+	if (s.level >= 2 && j % 3u == 0 && x % 3u == s.h3) return true;
+	if (s.level >= 3 && ((j % 5u == 0 && x % 5u == s.h5) || (j % 7u == 0 && x % 7u == s.h7))) return true;
+	return false;
+}
+
 
 __device__ __forceinline__ uint32_t d_mod(int64_t x, uint32_t p) { int64_t r = x % (int64_t)p; return (uint32_t)(r < 0 ? r + p : r); }
 __device__ uint32_t d_invmod(uint32_t a, uint32_t m)
@@ -581,6 +604,13 @@ __global__ void k_transform(DevFB fb, uint64_t q, int64_t a0, int64_t b0, int64_
 	fb.R[k] = (uint32_t)((uint64_t)(B ? p - B : 0) * inv % p);
 }
 
+// -lim with values near 2^255 (see lscale): the large entries' logs, scaled (a large entry's base is its modulus)
+__global__ void k_scale_logp(const uint32_t* p, uint8_t* logp, int k0, int n, double s)
+{
+	const int k = k0 + blockIdx.x * blockDim.x + threadIdx.x;
+	if (k < n) logp[k] = (uint8_t)llround(s * log2((double)p[k]));
+}
+
 // Franke-Kleinjung: reduce the lattice {(i,j): i = j*R mod p} for width I to warp (-mi0,j0), step (i1,j1).
 __device__ bool fk_reduce(uint32_t p, uint32_t R, uint32_t I, uint32_t& mi0, uint32_t& j0, uint32_t& i1, uint32_t& j1)
 {
@@ -625,7 +655,7 @@ __device__ __forceinline__ void fk_step(uint32_t& x, uint32_t& j, uint32_t I, ui
 template <bool INNER, bool SKIP>
 __global__ void k_buckets(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jhi, uint2* st, bool resume,
                           uint32_t* bucket, uint32_t* count, uint32_t cap, unsigned long long* dropped,
-                          uint32_t jin, uint32_t xlo, uint32_t xhi)
+                          uint32_t jin, uint32_t xlo, uint32_t xhi, SkipC sk)
 {
 	const uint32_t I = 1u << logI, shift = logI - logR, rmask = (1u << logR) - 1;
 	for (int k = fb.nsmall + fb.nline + blockIdx.x * blockDim.x + threadIdx.x; k < fb.n; k += gridDim.x * blockDim.x) {
@@ -646,7 +676,7 @@ __global__ void k_buckets(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, 
 		if (!SKIP && resume) { const uint2 s = st[k - fb.nsmall]; x = s.x; j = s.y; }
 		else if (!resume) { x = I >> 1; j = 0; fk_step(x, j, I, mi0, j0, i1, j1); }     // x = i + I/2: the first hit after (0,0)
 		while (j < jhi) {
-			if (!INNER || j >= jin || x < xlo || x >= xhi) {
+			if ((!INNER || j >= jin || x < xlo || x >= xhi) && !skip_pt(sk, x, j)) {
 				const size_t g = ((size_t)(j - jlo) << shift) | (x >> logR);
 				uint32_t slot = atomicAdd(&count[g * CPAD], 1u);
 				if (slot < cap) bucket[g * cap + slot] = ((x & rmask) << 8) | lp;
@@ -670,7 +700,7 @@ __device__ __forceinline__ bool fk_next(uint32_t& x, uint32_t& j, uint32_t I, ui
 }
 __global__ void __launch_bounds__(1024, 1)
 k_buckets2(DevFB fb, uint32_t logI, uint32_t J, const int* chunk, uint32_t* bucket, uint32_t* count, uint32_t cap,
-           unsigned long long* dropped, uint32_t jin, uint32_t xlo, uint32_t xhi)
+           unsigned long long* dropped, uint32_t jin, uint32_t xlo, uint32_t xhi, SkipC sk)
 {
 	extern __shared__ uint32_t hist[];           // J counters
 	const uint32_t I = 1u << logI;
@@ -683,7 +713,7 @@ k_buckets2(DevFB fb, uint32_t logI, uint32_t J, const int* chunk, uint32_t* buck
 		uint32_t mi0, j0, i1, j1;
 		if (!fk_reduce(fb.p[k], R, I, mi0, j0, i1, j1)) continue;
 		uint32_t x = I >> 1, j = 0;
-		for (;;) { fk_next(x, j, I, mi0, j0, i1, j1); if (j >= J) break; if (j >= jin || x < xlo || x >= xhi) atomicAdd(&hist[j], 1u); }
+		for (;;) { fk_next(x, j, I, mi0, j0, i1, j1); if (j >= J) break; if ((j >= jin || x < xlo || x >= xhi) && !skip_pt(sk, x, j)) atomicAdd(&hist[j], 1u); }
 	}
 	__syncthreads();
 	for (uint32_t r = threadIdx.x; r < J; r += blockDim.x) {
@@ -700,7 +730,7 @@ k_buckets2(DevFB fb, uint32_t logI, uint32_t J, const int* chunk, uint32_t* buck
 		for (;;) {
 			fk_next(x, j, I, mi0, j0, i1, j1);
 			if (j >= J) break;
-			if (j < jin && x >= xlo && x < xhi) continue;
+			if ((j < jin && x >= xlo && x < xhi) || skip_pt(sk, x, j)) continue;
 			uint32_t slot = atomicAdd(&hist[j], 1u);
 			if (slot < cap) bucket[(size_t)j * cap + slot] = (x << 8) | lp;
 			else atomicAdd(dropped, 1ull);
@@ -753,6 +783,14 @@ template <int MODE> __device__ __forceinline__ void entry_start(const DevFB& fb,
 	if (R >= R_PROJ) return;
 	p = fb.p[k]; lp = fb.logp[k]; st = region_start<MODE>(j, R, p, fb.minv[k], I, x0);
 }
+// -skip 1 or more, in an even row: only the odd columns are sieved (i and j even: not coprime). The region's first column x0 is
+// even, so a column's parity is that of x. An odd modulus then steps 2*step from its first odd hit; an even one (a power
+// of 2) has hits of one parity only, and none here if they are even.
+__device__ __forceinline__ void odd_only(uint32_t& st, uint32_t& step, uint32_t RS)
+{
+	if (step & 1) { if (!(st & 1)) st += step; step <<= 1; }
+	else if (!(st & 1)) st = RS;
+}
 
 // one block per region (blocks loop over the regions when the grid is smaller): small primes into shared memory, then the
 // region's bucket, then the survivors. 3 blocks of 512 threads per SM: the shared memory (32 KB per block for I = 2^15) allows no more
@@ -769,8 +807,8 @@ struct NormPoly { float G[MAXD + 1]; int d; float invS; };
 template <int MODE, bool POLY> __global__ void __launch_bounds__(512, ROWS_MINB)
 k_rows(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jn, const uint32_t* bucket, const uint32_t* count, uint32_t cap,
                        int64_t a0, int64_t b0, int64_t a1, int64_t b1, float alpha, float beta, NormPoly np, float log_scale,
-                       float mfb_slack, bool dummy, long long c1, long long c0, float dummy_bits,
-                       OutPair* out, unsigned int* nout, unsigned int maxout, uint32_t jin, uint32_t xlo, uint32_t xhi)
+                       float mfb_slack, float lsc, bool dummy, long long c1, long long c0, float dummy_bits,
+                       OutPair* out, unsigned int* nout, unsigned int maxout, uint32_t jin, uint32_t xlo, uint32_t xhi, bool rowskip)
 {
 	extern __shared__ uint32_t sh[];
 	const uint32_t I = 1u << logI, RS = 1u << logR, shift = MODE == ONE_REGION ? 0 : logI - logR, rpr = 1u << shift;
@@ -788,6 +826,7 @@ k_rows(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jn, const 
 	uint32_t bonus = 0;             // log sum of the projective entries dividing every value of this row
 	for (uint32_t t = 0; t < nproj; t++) { int k = fb.proj[t]; if (j % fb.p[k] == 0) bonus += fb.logp[k]; }
 	__syncthreads();
+	const bool ev = rowskip && !(j & 1);     // -skip: an even row, only its odd columns are sieved
 	// tiny primes (p < tiny, default 64): all threads share each prime. Larger primes have too few hits in a region for all
 	// threads to share them (in tests, the rows took twice as long with tiny 1024 as with 64).
 	// Here and for the medium primes, the lanes of a warp first compute the starts of up to 32 entries, one each, and pass
@@ -797,6 +836,7 @@ k_rows(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jn, const 
 	for (int k0 = 0; k0 < fb.ktiny; k0 += 32) {
 		uint32_t p, st, lp;
 		entry_start<MODE>(fb, k0 + (int)lane, fb.ktiny, j, I, x0, RS, p, st, lp);
+		if (ev) odd_only(st, p, RS);
 		for (int e = 0; e < min(32, fb.ktiny - k0); e++) {
 			const uint32_t pe = __shfl_sync(0xffffffffu, p, e), le = __shfl_sync(0xffffffffu, lp, e);
 			for (uint32_t x = __shfl_sync(0xffffffffu, st, e) + threadIdx.x * pe; x < RS; x += blockDim.x * pe) add_log(sh, x, le);
@@ -806,7 +846,8 @@ k_rows(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jn, const 
 	for (uint32_t t = 0; t < npart; t++) {
 		const uint4 e = fb.part[t];
 		if (j % e.z) continue;
-		const uint32_t m2 = e.x, start = region_start<MODE>(j / e.z, e.y, m2, 0xffffffffu / m2, I, x0);
+		uint32_t m2 = e.x, start = region_start<MODE>(j / e.z, e.y, m2, 0xffffffffu / m2, I, x0);
+		if (ev) odd_only(start, m2, RS);
 		for (uint32_t x = start + threadIdx.x * m2; x < RS; x += blockDim.x * m2) add_log(sh, x, e.w);
 	}
 	// medium primes (tiny <= p < med, default 2048): one warp each, whose lanes share the hits. With one thread per prime the
@@ -819,6 +860,7 @@ k_rows(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jn, const 
 		for (int k0 = fb.ktiny + 32 * (int)warp; k0 < fb.kmed; k0 += 32 * (int)nwarp) {
 			uint32_t p, st, lp;
 			entry_start<MODE>(fb, k0 + (int)lane, fb.kmed, j, I, x0, RS, p, st, lp);
+			if (ev) odd_only(st, p, RS);
 			for (int e = 0; e < min(32, fb.kmed - k0); e++) {
 				const uint32_t pe = __shfl_sync(0xffffffffu, p, e), le = __shfl_sync(0xffffffffu, lp, e);
 				for (uint32_t x = __shfl_sync(0xffffffffu, st, e) + lane * pe; x < RS; x += 32 * pe) add_log(sh, x, le);
@@ -830,8 +872,9 @@ k_rows(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jn, const 
 		uint32_t p = fb.p[k];
 		uint32_t R = fb.R[k];
 		if (R >= R_PROJ) continue;
-		uint32_t lp = fb.logp[k];
-		for (uint32_t x = region_start<MODE>(j, R, p, fb.minv[k], I, x0); x < RS; x += p) add_log(sh, x, lp);
+		uint32_t lp = fb.logp[k], st = region_start<MODE>(j, R, p, fb.minv[k], I, x0);
+		if (ev) odd_only(st, p, RS);
+		for (uint32_t x = st; x < RS; x += p) add_log(sh, x, lp);
 	}
 	// line primes (I <= p < -line): at most one hit per row, at x = (j*R + I/2) mod p (the Franke-Kleinjung walk of the
 	// buckets enumerates the same points; R = 0 has only non-coprime ones). Testing each such prime in each region is
@@ -847,7 +890,7 @@ k_rows(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jn, const 
 		while (r < 0) r += p;
 		while (r >= (int64_t)p) r -= p;
 		const uint32_t x = (uint32_t)r - x0;
-		if (x < RS) add_log(sh, x, fb.logp[k]);
+		if (x < RS && !(ev && !(x & 1))) add_log(sh, x, fb.logp[k]);
 	}
 	// large primes from the bucket of this region
 	uint32_t n = min(count[(size_t)g * CPAD], cap);
@@ -865,7 +908,8 @@ k_rows(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jn, const 
 		for (int k = MAXD; k >= 0; k--) { if (k <= np.d) { hc[k] = np.G[k] * pw; pw *= u; } else hc[k] = 0.f; }
 		t0 = ((float)x0 - (float)(I >> 1)) * np.invS;
 	}
-	for (uint32_t x = threadIdx.x; x < RS; x += blockDim.x) {
+	const uint32_t xs = ev ? 2 : 1;   // -skip: only the odd columns of an even row
+	for (uint32_t x = threadIdx.x * xs + (xs - 1); x < RS; x += blockDim.x * xs) {
 		if (j < jin && x0 + x >= xlo && x0 + x < xhi) continue;
 		float lv;                       // log2 of the value/q scaled by 2^-log_scale
 		if (POLY) {
@@ -888,8 +932,9 @@ k_rows(DevFB fb, uint32_t logI, uint32_t logR, uint32_t jlo, uint32_t jn, const 
 				lv = (float)log2(fmax(fabs(vd), 1e-300));
 			}
 		} else lv = __log2f(fmaxf(fabsf(fmaf(alpha, (float)x, bj)), 1e-30f));
-		const float thr = lv + log_scale - mfb_slack;   // value/q = 2^(lv + log_scale)
-		if ((float)(bytes[x] + bonus) < thr) continue;
+		const float thr = (lv + log_scale - mfb_slack) * lsc;   // value/q = 2^(lv + log_scale); lsc: the log scale of the bytes
+		const float sum = (float)(bytes[x] + bonus);
+		if (sum < thr) continue;
 		int64_t i = (int64_t)(x0 + x) - (int64_t)(I >> 1);
 		int64_t b = i * b0 + (int64_t)j * b1;
 		if (b == 0) continue;
@@ -910,6 +955,7 @@ int main(int argc, char** argv)
 	const char* polyf = nullptr; const char* outf = nullptr; const char* qfile = nullptr;
 	int logI = 15, logIin = 0; uint64_t lim = 25000000; int mfb = 56; double slack = 12;   // logIin: A of -I A-B (0: none)
 	uint64_t q0 = 0, q1 = 0; long nrandom = 0; uint32_t tiny = 64, med = 2048; long long line_opt = -1; int verbose = 0; double dummy_bits = 0; int oldbuckets = 1;
+	int skip_level = 3, noscale = 0;   // see -skip, -noscale
 	int lanes = 1, bblocks = 0, rblocks = 0; double progress_s = 60; int side = -1; const char* dumpfb = nullptr; double maxout_m = 16;
 	long nparts_opt = 0;
 	int nthreads = (int)std::min(16u, std::max(1u, std::thread::hardware_concurrency()));
@@ -959,6 +1005,8 @@ int main(int argc, char** argv)
 		else if (s == "-dumpfb") dumpfb = nxt();
 		else if (s == "-maxout") maxout_m = atof(nxt());
 		else if (s == "-parts") nparts_opt = atol(nxt());
+		else if (s == "-skip") skip_level = std::max(0, std::min(3, atoi(nxt())));
+		else if (s == "-noscale") noscale = 1;
 		else { fprintf(stderr, "unknown option %s\n", s.c_str()); return 1; }
 	}
 	if (!polyf || (!dumpfb && (!outf || (!qfile && (!q0 || !q1))))) { fprintf(stderr, "usage: see the top of gpusieve.cu\n"); return 1; }
@@ -1030,14 +1078,15 @@ int main(int argc, char** argv)
 	auto t_start = std::chrono::steady_clock::now();
 
 	// factor base: primes up to lim; prime powers below I for the small primes. The large entries (p >= I, nearly all of
-	// them) are built in chunks of the range by a segmented sieve, straight into arrays of p, y0 and y1 (12 bytes per
-	// entry; base = p and logp follow from p), so that the host needs little more than the factor base itself.
+	// them: 203M at lim 2^32) are built in chunks of the range by a segmented sieve, a batch of chunks at a time on the
+	// host threads, and each batch is copied to the GPU before the next is built. So the host holds only a batch (under
+	// 100 MB) instead of the whole factor base: building it whole (12 bytes per entry, its chunks and their concatenation
+	// at once, then a 4-byte copy of the moduli kept for the run) took 4.5 GB at lim 2^32 and kept 1 GB.
 	if (lim >= (1ull << 32)) { fprintf(stderr, "lim must be below 2^32\n"); return 1; }
 	const std::vector<uint32_t> sieve_primes = base_primes((uint32_t)sqrtl((long double)lim) + 2);
 	struct E { uint32_t p, base, y0, y1; uint8_t lg; };
 	std::vector<E> small;
 	auto lgp = [](uint64_t p) { return (uint8_t)lround(log2((double)p)); };
-	std::vector<uint32_t> lpv, ly0, ly1;                 // large entries
 	{
 		std::vector<uint32_t> sp;                        // primes below I (and up to lim)
 		seg_primes(2, std::min<uint64_t>(I, lim + 1), sieve_primes, sp);
@@ -1063,77 +1112,58 @@ int main(int argc, char** argv)
 				}
 			}
 		}
-		if ((uint64_t)I <= lim) {
-			const uint64_t lo = I, hi = lim + 1;
-			const size_t nchunk = 4096;
-			struct Chunk { std::vector<uint32_t> p, y0, y1; };
-			std::vector<Chunk> part(nchunk);
-			parallel_for(nchunk, nthreads, [&](size_t c) {
-				std::vector<uint32_t> ps;
-				seg_primes(lo + (hi - lo) * c / nchunk, lo + (hi - lo) * (c + 1) / nchunk, sieve_primes, ps);
-				Chunk& C = part[c];
-				if (!poly_norm) {
-					C.p = ps; C.y0.resize(ps.size()); C.y1.resize(ps.size());
-					for (size_t t = 0; t < ps.size(); t++) { C.y0[t] = (uint32_t)mod_str(g_spoly[0], ps[t]); C.y1[t] = (uint32_t)mod_str(g_spoly[1], ps[t]); }
-				} else {
-					uint64_t f[MAXD + 1]; std::vector<uint64_t> roots;
-					for (uint32_t p : ps) {
-						spoly_mod(p, f);
-						if (!roots_mod_p(f, sdeg, p, roots)) continue;
-						for (uint64_t r : roots) { C.p.push_back(p); C.y0.push_back((uint32_t)((p - r) % p)); C.y1.push_back(1); }
-						if (f[sdeg] == 0) { C.p.push_back(p); C.y0.push_back(1); C.y1.push_back(0); }   // projective: (-s, 1), s = 0
-					}
-				}
-			});
-			size_t tot = 0; for (const Chunk& C : part) tot += C.p.size();
-			lpv.reserve(tot); ly0.reserve(tot); ly1.reserve(tot);
-			for (Chunk& C : part) {
-				lpv.insert(lpv.end(), C.p.begin(), C.p.end()); ly0.insert(ly0.end(), C.y0.begin(), C.y0.end());
-				ly1.insert(ly1.end(), C.y1.begin(), C.y1.end());
-				std::vector<uint32_t>().swap(C.p); std::vector<uint32_t>().swap(C.y0); std::vector<uint32_t>().swap(C.y1);
-			}
-		}
 	}
 	// small entries sorted by modulus (prime powers of tiny primes stay tiny)
 	std::sort(small.begin(), small.end(), [](const E& x, const E& y) { return x.p < y.p; });
 	const int nsmall = (int)small.size();
-	const size_t nlg = lpv.size();
-	if ((size_t)nsmall + nlg >= (1ull << 31)) { fprintf(stderr, "factor base too large (%zu entries)\n", nsmall + nlg); return 1; }
-	if (dumpfb) {           // debug: the factor base as "modulus prime y1 y0" (hits: modulus | y1*a + y0*b)
-		FILE* d = fopen(dumpfb, "w"); if (!d) { perror(dumpfb); return 1; }
-		for (const E& e : small) fprintf(d, "%u %u %u %u\n", e.p, e.base, e.y1, e.y0);
-		for (size_t t = 0; t < nlg; t++) fprintf(d, "%u %u %u %u\n", lpv[t], lpv[t], ly1[t], ly0[t]);
-		fclose(d);
-		fprintf(stderr, "factor base: %zu entries (%d below I) written to %s in %.1f s\n", nsmall + nlg, nsmall, dumpfb,
-			std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
-		return 0;
-	}
-	DevFB fb; fb.n = (int)(nsmall + nlg); fb.nsmall = nsmall; fb.proj = fb.nproj = fb.npart = nullptr; fb.part = nullptr;
-	// GPU memory that does not shrink with more passes: the factor base (p, y0, y1, logp: 13 bytes per entry; base and the
-	// Barrett constant of the small entries: 8 more each), each lane's R (and the small entries' projective/partial lists)
-	// and the two survivor buffers. A GPU without room for it in all can never run this; then fail instead of retrying (an
-	// allocation that fails later, with the room there in all, means other programs hold the memory: a temporary exit).
-	const double fb_bytes = 13.0 * fb.n + 8.0 * nsmall, lane_fb_bytes = 4.0 * fb.n + 20.0 * nsmall;
-	const double fixed_bytes = fb_bytes + lanes * lane_fb_bytes + 16.0 * std::min<double>(maxout_m * 1048576.0, 4e9);
-	if (fixed_bytes > 0.9 * (double)gpu_total) {
-		fprintf(stderr, "the GPU has %.2f GB; the factor base and survivor buffers alone need %.2f GB (lower -lim or -maxout)\n",
-			gpu_total / 1e9, fixed_bytes / 1e9);
-		gs_boinc_finish(1);
-	}
-	fb.ktiny = (int)(std::find_if(small.begin(), small.end(), [&](const E& e) { return e.p >= tiny; }) - small.begin());
-	med = std::max(med, tiny);
 	// line-sieved large entries: I <= p < line_lim (below 2^20, so that j*R stays far below the float quotient's limits).
 	// Default 2^17 for I <= 2^16 (RTX 4090: 7 % faster at I = 16, 12 % at 15, 24 % at 13; T4: 2 % at 16, 0 at 15); none for
 	// larger I, whose rows have several regions, each of which tests every line prime again (I = 17, 4090: 13 % slower).
 	uint64_t line_lim = line_opt >= 0 ? (uint64_t)line_opt : logI <= 16 ? (1u << 17) : 0;
 	line_lim = std::min<uint64_t>(line_lim, 1u << 20);
-	fb.nline = (int)(std::lower_bound(lpv.begin(), lpv.end(), (uint32_t)std::min<uint64_t>(line_lim, 0xffffffffu)) - lpv.begin());
-	if (line_lim <= I) fb.nline = 0;
+	if (line_lim <= I) line_lim = 0;
+	// The large entries' count is known only once they are built (the roots of each prime on a side of degree >= 2), so
+	// the GPU arrays start at an estimate: the primes in [I, lim] by the logarithmic integral (above the prime count in
+	// this range), 1 % and 100000 more. Each prime has on average one root on an irreducible side; should the entries
+	// still exceed it, the arrays grow.
+	size_t lcap = 0;
+	const uint64_t llo = I, lhi = lim + 1;
+	if (llo < lhi) {
+		const int N = 1 << 16; const double u0 = log((double)llo), u1 = log((double)lhi), h = (u1 - u0) / N;
+		double li = 0;          // integral of dt / ln t = integral of e^u / u du, Simpson
+		for (int t = 0; t <= N; t++) { const double u = u0 + t * h; li += (t == 0 || t == N ? 1 : t & 1 ? 4 : 2) * exp(u) / u; }
+		li *= h / 3;
+		lcap = (size_t)(li * 1.01) + 100000;
+	}
+	if ((size_t)nsmall + lcap >= (1ull << 31)) { fprintf(stderr, "factor base too large (about %zu entries)\n", nsmall + lcap); return 1; }
+	FILE* dumpf = nullptr;
+	if (dumpfb) {           // debug: the factor base as "modulus prime y1 y0" (hits: modulus | y1*a + y0*b)
+		dumpf = fopen(dumpfb, "w"); if (!dumpf) { perror(dumpfb); return 1; }
+		for (const E& e : small) fprintf(dumpf, "%u %u %u %u\n", e.p, e.base, e.y1, e.y0);
+	}
+	DevFB fb; fb.n = (int)(nsmall + lcap); fb.nsmall = nsmall; fb.proj = fb.nproj = fb.npart = nullptr; fb.part = nullptr;
+	// GPU memory that does not shrink with more passes: the factor base (p, y0, y1, logp: 13 bytes per entry; base and the
+	// Barrett constant of the small entries: 8 more each), each lane's R (and the small entries' projective/partial lists)
+	// and the two survivor buffers. A GPU without room for it in all can never run this; then fail instead of retrying (an
+	// allocation that fails later, with the room there in all, means other programs hold the memory: a temporary exit).
+	// (fb.n is the estimate here, set to the true count below.)
+	if (!dumpf) {
+		const double fixed_bytes = 13.0 * fb.n + 8.0 * nsmall + lanes * (4.0 * fb.n + 20.0 * nsmall) + 16.0 * std::min<double>(maxout_m * 1048576.0, 4e9);
+		if (fixed_bytes > 0.9 * (double)gpu_total) {
+			fprintf(stderr, "the GPU has %.2f GB; the factor base and survivor buffers alone need %.2f GB (lower -lim or -maxout)\n",
+				gpu_total / 1e9, fixed_bytes / 1e9);
+			gs_boinc_finish(1);
+		}
+	}
+	fb.ktiny = (int)(std::find_if(small.begin(), small.end(), [&](const E& e) { return e.p >= tiny; }) - small.begin());
+	med = std::max(med, tiny);
 	fb.kmed = (int)(std::find_if(small.begin(), small.end(), [&](const E& e) { return e.p >= med; }) - small.begin());
 	// (base only for the small entries: a large entry is a prime, its own base. R: each lane allocates its own below.)
-	CHECK(cudaMalloc(&fb.p, (size_t)fb.n * 4)); CHECK(cudaMalloc(&fb.base, (size_t)std::max(nsmall, 1) * 4)); CHECK(cudaMalloc(&fb.y0, (size_t)fb.n * 4));
-	CHECK(cudaMalloc(&fb.y1, (size_t)fb.n * 4)); CHECK(cudaMalloc(&fb.logp, (size_t)fb.n)); fb.R = nullptr;
-	{   // the small entries, then the large ones behind them
+	size_t fbcap = dumpf ? 0 : (size_t)fb.n;
+	fb.R = nullptr; fb.p = fb.y0 = fb.y1 = fb.base = fb.minv = nullptr; fb.logp = nullptr;
+	if (!dumpf) {
+		CHECK(cudaMalloc(&fb.p, fbcap * 4)); CHECK(cudaMalloc(&fb.base, (size_t)std::max(nsmall, 1) * 4)); CHECK(cudaMalloc(&fb.y0, fbcap * 4));
+		CHECK(cudaMalloc(&fb.y1, fbcap * 4)); CHECK(cudaMalloc(&fb.logp, fbcap));
 		std::vector<uint32_t> a(nsmall), b(nsmall), c(nsmall), d(nsmall); std::vector<uint8_t> l(nsmall);
 		for (int t = 0; t < nsmall; t++) { a[t] = small[t].p; b[t] = small[t].base; c[t] = small[t].y0; d[t] = small[t].y1; l[t] = small[t].lg; }
 		CHECK(cudaMemcpy(fb.p, a.data(), (size_t)nsmall * 4, cudaMemcpyHostToDevice));
@@ -1144,19 +1174,87 @@ int main(int argc, char** argv)
 		std::vector<uint32_t> mv(std::max(nsmall, 1));      // Barrett constants (mod_b) of the small entries
 		for (int t = 0; t < nsmall; t++) mv[t] = 0xffffffffu / small[t].p;
 		CHECK(cudaMalloc(&fb.minv, mv.size() * 4)); CHECK(cudaMemcpy(fb.minv, mv.data(), mv.size() * 4, cudaMemcpyHostToDevice));
-		CHECK(cudaMemcpy(fb.p + nsmall, lpv.data(), nlg * 4, cudaMemcpyHostToDevice));
-		CHECK(cudaMemcpy(fb.y0 + nsmall, ly0.data(), nlg * 4, cudaMemcpyHostToDevice));
-		CHECK(cudaMemcpy(fb.y1 + nsmall, ly1.data(), nlg * 4, cudaMemcpyHostToDevice));
-		std::vector<uint8_t> ll(nlg); for (size_t t = 0; t < nlg; t++) ll[t] = lgp(lpv[t]);
-		CHECK(cudaMemcpy(fb.logp + nsmall, ll.data(), nlg, cudaMemcpyHostToDevice));
 	}
-	// fp: the moduli on the host (the bucket chunking and the expected bucket fill below use them)
-	std::vector<uint32_t> fp(fb.n);
-	for (int t = 0; t < nsmall; t++) fp[t] = small[t].p;
-	std::copy(lpv.begin(), lpv.end(), fp.begin() + nsmall);
-	std::vector<uint32_t>().swap(lpv); std::vector<uint32_t>().swap(ly0); std::vector<uint32_t>().swap(ly1);
+	// the large entries, a batch of chunks at a time. Besides the entries, each chunk counts those below line_lim (the
+	// entries are sorted, so these give nline) and sums 1/p of those at or above it (the bucket-sieved ones: the
+	// expected bucket fill). -twopass keeps the moduli on the host for its chunking.
+	size_t nlg = 0;
+	int nbelow_line = 0;
+	double inv_sum = 0;
+	std::vector<uint32_t> fp_tp;                     // -twopass: the large moduli
+	if (llo < lhi) {
+		const size_t nchunk = 4096, batch = std::max<size_t>(64, 8 * (size_t)nthreads);
+		struct Chunk { std::vector<uint32_t> p, y0, y1; std::vector<uint8_t> lg; int nl = 0; double inv = 0; };
+		std::vector<Chunk> part(batch);
+		// grow the GPU arrays to hold at least `need` entries (copies on the GPU; rare: only if the estimate was low)
+		auto grow = [&](size_t need) {
+			size_t nc = std::max(need, fbcap + fbcap / 8);
+			auto re = [&](auto*& ptr, size_t elem) {
+				void* np = nullptr; CHECK(cudaMalloc(&np, nc * elem));
+				CHECK(cudaMemcpy(np, ptr, (nsmall + nlg) * elem, cudaMemcpyDeviceToDevice));
+				CHECK(cudaFree(ptr)); ptr = (std::remove_reference_t<decltype(ptr)>)np;
+			};
+			re(fb.p, 4); re(fb.y0, 4); re(fb.y1, 4); re(fb.logp, 1);
+			fprintf(stderr, "factor base: more entries than estimated, GPU arrays grown from %zu to %zu\n", fbcap, nc);
+			fbcap = nc;
+		};
+		for (size_t c0 = 0; c0 < nchunk; c0 += batch) {
+			const size_t nb = std::min(batch, nchunk - c0);
+			parallel_for(nb, nthreads, [&](size_t t) {
+				const size_t c = c0 + t;
+				std::vector<uint32_t> ps;
+				seg_primes(llo + (lhi - llo) * c / nchunk, llo + (lhi - llo) * (c + 1) / nchunk, sieve_primes, ps);
+				Chunk& C = part[t];
+				C.p.clear(); C.y0.clear(); C.y1.clear();
+				if (!poly_norm) {
+					C.p = ps; C.y0.resize(ps.size()); C.y1.resize(ps.size());
+					for (size_t u = 0; u < ps.size(); u++) { C.y0[u] = (uint32_t)mod_str(g_spoly[0], ps[u]); C.y1[u] = (uint32_t)mod_str(g_spoly[1], ps[u]); }
+				} else {
+					uint64_t f[MAXD + 1]; std::vector<uint64_t> roots;
+					for (uint32_t p : ps) {
+						spoly_mod(p, f);
+						if (!roots_mod_p(f, sdeg, p, roots)) continue;
+						for (uint64_t r : roots) { C.p.push_back(p); C.y0.push_back((uint32_t)((p - r) % p)); C.y1.push_back(1); }
+						if (f[sdeg] == 0) { C.p.push_back(p); C.y0.push_back(1); C.y1.push_back(0); }   // projective: (-s, 1), s = 0
+					}
+				}
+				C.lg.resize(C.p.size()); C.nl = 0; C.inv = 0;
+				for (size_t u = 0; u < C.p.size(); u++) {
+					const uint32_t p = C.p[u];
+					C.lg[u] = lgp(p);
+					if (p < line_lim) C.nl++; else C.inv += 1.0 / p;
+				}
+			}, 1);     // one chunk at a time: a batch has only a few per thread
+			for (size_t t = 0; t < nb; t++) {
+				Chunk& C = part[t];
+				const size_t m = C.p.size();
+				if (dumpf) for (size_t u = 0; u < m; u++) fprintf(dumpf, "%u %u %u %u\n", C.p[u], C.p[u], C.y1[u], C.y0[u]);
+				else if (m) {
+					if (nsmall + nlg + m > fbcap) grow(nsmall + nlg + m);
+					const size_t at = nsmall + nlg;
+					CHECK(cudaMemcpy(fb.p + at, C.p.data(), m * 4, cudaMemcpyHostToDevice));
+					CHECK(cudaMemcpy(fb.y0 + at, C.y0.data(), m * 4, cudaMemcpyHostToDevice));
+					CHECK(cudaMemcpy(fb.y1 + at, C.y1.data(), m * 4, cudaMemcpyHostToDevice));
+					CHECK(cudaMemcpy(fb.logp + at, C.lg.data(), m, cudaMemcpyHostToDevice));
+				}
+				if (!oldbuckets) fp_tp.insert(fp_tp.end(), C.p.begin(), C.p.end());
+				nlg += m; nbelow_line += C.nl; inv_sum += C.inv;
+			}
+		}
+	}
+	if ((size_t)nsmall + nlg >= (1ull << 31)) { fprintf(stderr, "factor base too large (%zu entries)\n", nsmall + nlg); return 1; }
+	if (dumpf) {
+		fclose(dumpf);
+		fprintf(stderr, "factor base: %zu entries (%d below I) written to %s in %.1f s\n", nsmall + nlg, nsmall, dumpfb,
+			std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
+		return 0;
+	}
+	fb.n = (int)(nsmall + nlg);
+	fb.nline = line_lim ? nbelow_line : 0;
+	const double fb_bytes = 13.0 * fb.n + 8.0 * nsmall, lane_fb_bytes = 4.0 * fb.n + 20.0 * nsmall;
 	fprintf(stderr, "factor base: %d entries (%d below I = %u), set up in %.1f s\n", fb.n, nsmall, I,
 		std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
+
 
 	// special-q list
 	std::vector<QLattice> qs;
@@ -1177,6 +1275,7 @@ int main(int argc, char** argv)
 				}
 				qs.push_back({q, r, a0, b0, a1, b1, J});
 				QLattice M = reduce_q(q, poly_norm ? r : lin_root(q), P.skew, logI);   // compare with our own reduction
+				qs.back().lmax = M.lmax;
 				bool same = M.r == r && M.J == J && ((M.a0 == a0 && M.b0 == b0) || (M.a0 == -a0 && M.b0 == -b0))
 				            && ((M.a1 == a1 && M.b1 == b1) || (M.a1 == -a1 && M.b1 == -b1));
 				if (!same) { nbasis_diff++; if (verbose) fprintf(stderr, "q=%llu: las basis (%lld,%lld) (%lld,%lld) J=%u, ours (%lld,%lld) (%lld,%lld) J=%u\n",
@@ -1225,14 +1324,35 @@ int main(int argc, char** argv)
 		if (basis_diff) { fprintf(stderr, "internal error: the basis of %ld special-q depends on I\n", (long)basis_diff); return 1; }
 	}
 	fprintf(stderr, "%zu special-q\n", qs.size());
+	// The sieve adds logs into bytes with 32-bit atomics (add_log): a sum above 255 would wrap and carry into the next
+	// point. A point's sum is about log2|F/q| at most (rounded logs, prime powers), so if the largest |F/q| of the region
+	// comes near 2^255, all logs and thresholds are scaled by lscale (as las' scale): 245 / its log2.
+	double lscale = 1;
+	{
+		double ml = 0; for (const QLattice& Q : qs) ml = std::max(ml, Q.lmax);
+		if (ml > 245 && !noscale) {
+			lscale = 245 / ml;
+			std::vector<uint8_t> l(nsmall);
+			for (int t = 0; t < nsmall; t++) l[t] = (uint8_t)lround(lscale * log2((double)small[t].base));
+			CHECK(cudaMemcpy(fb.logp, l.data(), nsmall, cudaMemcpyHostToDevice));
+			if (fb.n > nsmall) k_scale_logp<<<(fb.n - nsmall + 255) / 256, 256>>>(fb.p, fb.logp, nsmall, fb.n, lscale);
+			CHECK(cudaDeviceSynchronize());
+			fprintf(stderr, "values up to 2^%.1f: logs scaled by %.4f so that the sieve sums stay below 256\n", ml, lscale);
+		}
+	}
 
 	// chunks of large primes with equal expected hits (about I*J/p each), for k_buckets2
 	const int nchunks = 320;
 	std::vector<int> hchunk; {
 		const int kb = nsmall + fb.nline;     // the first bucket-sieved entry
-		double total = 0; for (int k = kb; k < fb.n; k++) total += 1.0 / fp[k];
-		double acc = 0; hchunk.push_back(kb);
-		for (int k = kb; k < fb.n; k++) { acc += 1.0 / fp[k]; if (acc >= total * hchunk.size() / nchunks && (int)hchunk.size() < nchunks) hchunk.push_back(k + 1); }
+		hchunk.push_back(kb);
+		if (!oldbuckets) {
+			auto fpk = [&](int k) { return fp_tp[k - nsmall]; };
+			double total = 0; for (int k = kb; k < fb.n; k++) total += 1.0 / fpk(k);
+			double acc = 0;
+			for (int k = kb; k < fb.n; k++) { acc += 1.0 / fpk(k); if (acc >= total * hchunk.size() / nchunks && (int)hchunk.size() < nchunks) hchunk.push_back(k + 1); }
+			std::vector<uint32_t>().swap(fp_tp);
+		}
 		hchunk.push_back(fb.n);
 	}
 	int* dchunk; CHECK(cudaMalloc(&dchunk, hchunk.size() * sizeof(int)));
@@ -1249,7 +1369,6 @@ int main(int argc, char** argv)
 	// its own rows only; the large primes' walks continue from one pass to the next (k_buckets, st: 8 bytes per large entry).
 	const uint32_t Jmax = I >> 1;
 	const int nlarge = fb.n - fb.nsmall;
-	double inv_sum = 0; for (int k = nsmall + fb.nline; k < fb.n; k++) inv_sum += 1.0 / fp[k];
 	const double expect = RS * inv_sum;
 	const uint32_t cap = ((uint32_t)(1.3 * expect + 10 * sqrt(expect)) + 255) & ~255u;
 	const unsigned int maxout = (unsigned int)std::min<double>(maxout_m * 1048576.0, 4e9);
@@ -1348,6 +1467,7 @@ int main(int argc, char** argv)
 		rblocks > 0 ? (std::to_string(nsm * rblocks) + " x 512, " + std::to_string(rsmem) + " bytes shared each").c_str()
 		            : "one block per region");
 
+	const SkipC skc = make_skip(skip_level, I);
 	auto enqueue = [&](size_t k) {
 		const QLattice& Q = qs[k]; Lane& L = lane[k % lanes]; Slot& s = slot[k & 1];
 		if (k >= (size_t)lanes) CHECK(cudaStreamWaitEvent(sb, L.rows_done, 0));   // rows of the lane's previous special-q done
@@ -1387,17 +1507,17 @@ int main(int argc, char** argv)
 				const auto kb = Q.Jin ? (skip ? k_buckets<true, true> : k_buckets<true, false>)
 				                      : (skip ? k_buckets<false, true> : k_buckets<false, false>);
 				kb<<<bgrid, 128, 0, sb>>>(L.fb, logI, logR, jlo, jlo + jn, L.st, t > 0, L.bucket, L.count, cap, s.dropped,
-				                          Q.Jin, xin_lo, xin_hi);
+				                          Q.Jin, xin_lo, xin_hi, skc);
 			} else k_buckets2<<<(int)hchunk.size() - 1, 1024, Q.J * 4, sb>>>(L.fb, logI, Q.J, dchunk, L.bucket, L.count, cap, s.dropped,
-			                                                               Q.Jin, xin_lo, xin_hi);
+			                                                               Q.Jin, xin_lo, xin_hi, skc);
 			CHECK(cudaEventRecord(s.pe[4 * t + 1], sb));
 			CHECK(cudaStreamWaitEvent(sr, s.pe[4 * t + 1], 0));
 			CHECK(cudaEventRecord(s.pe[4 * t + 2], sr));
 			const unsigned int nr = jn * rpr - (jlo ? 0 : rpr), rgrid = rblocks > 0 ? std::min<unsigned int>(nsm * rblocks, nr) : nr;
 			if (nr > 0)
-				rows_kernel<<<rgrid, 512, rsmem, sr>>>(L.fb, logI, logR, jlo, jn, L.bucket, L.count, cap, Q.a0, Q.b0, Q.a1, Q.b1, alpha, beta,
-				                              np, (float)e, (float)(mfb + slack), dummy, dc1, dc0, (float)dummy_bits, s.dout, s.dn, maxout,
-				                              Q.Jin, xin_lo, xin_hi);
+				rows_kernel<<<rgrid, 512, rsmem, sr>>>(L.fb, logI, logR, jlo, jn, L.bucket, L.count, cap, Q.a0, Q.b0, Q.a1, Q.b1,
+				                              alpha, beta, np, (float)e, (float)(mfb + slack), (float)lscale, dummy, dc1, dc0, (float)dummy_bits,
+				                              s.dout, s.dn, maxout, Q.Jin, xin_lo, xin_hi, skip_level >= 1);
 			CHECK(cudaGetLastError());
 			CHECK(cudaEventRecord(s.pe[4 * t + 3], sr));
 			CHECK(cudaEventRecord(L.rows_done, sr));
@@ -1457,7 +1577,7 @@ int main(int argc, char** argv)
 			const bool dummy_ok = !dummy || log2(fabs((double)dc1 * (double)a + (double)dc0 * (double)b) + 1) < dummy_bits;
 			long double F = 0, pa = 1;
 			for (int t = 0; t <= sdeg; t++) { long double pb = 1; for (int u = t; u < sdeg; u++) pb *= (long double)b; F += sc[t] * pa * pb; pa *= (long double)a; }
-			const bool sieved_ok = F != 0 && (double)*s.hrow0 >= (double)log2l(fabsl(F) / (long double)Q.q) - (double)(mfb + slack);
+			const bool sieved_ok = F != 0 && (double)*s.hrow0 >= ((double)log2l(fabsl(F) / (long double)Q.q) - (double)(mfb + slack)) * lscale;
 			if (b > 0 && b < (1ll << 32) && g == 1 && dummy_ok && sieved_ok) {
 				if (compact) keys.push_back((uint64_t)(1 + (I >> 1)));    // (i,j) = (1,0)
 				else { uint32_t b32 = (uint32_t)b; memcpy(w, &a, 8); memcpy(w + 8, &b32, 4); w += 12; }

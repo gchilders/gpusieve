@@ -224,6 +224,8 @@ counts as a large prime there. Then use a lim of at least the largest special-q 
 | `-ckpt FILE` | write a checkpoint to FILE (every `-ckpt-interval` seconds, default 60) | |
 | `-resume` | continue from the checkpoint of an interrupted run with the same poly file and parameters | |
 | `-device N` | the CUDA device (under BOINC the client's assignment wins) | 0 |
+| `-skip L` | leave out the points whose i and j have a common factor, which are never written: no bucket entries where 2 (`L` 1), also 3 (2), also 5 or 7 (3) divides both, and in the even rows only the odd columns are sieved. The output is the same at every level; 0 sieves every point (see [Speed](#speed)) | 3 |
+| `-noscale` | do not scale the logs when the sieved values reach `2^245` (see [Large values](#large-values)) | |
 
 Tuning options, rarely needed: `-tiny P` (primes below P are sieved by all threads of a region, default 64), `-med M`
 (primes from P to M are sieved by one warp each, default 2048), `-line L` (primes from I to L, at most 2^20, are
@@ -258,6 +260,33 @@ Besides one pass' buckets, the GPU holds the factor base (25 bytes per entry wit
 at lim `2^28` on a rational side, 2.6 GB at lim `2^31`, 5.1 GB at lim `2^32`) and two output buffers (16 MB per `-maxout`
 unit, 256 MB by default). So `-I 18` at lim `2^32` (32-bit large primes) needs 6 to 7 GB and runs on 8 GB GPUs.
 At startup gpusieve prints the number of passes and the memory it needs, and stops if the GPU does not have it.
+
+## Speed
+
+Sieving a point costs mostly its bucket entries: an atomic and a scattered store in the GPU's L2 cache for each hit of a
+large prime. A quarter of all points have i and j both even, 1/12 more have 3 dividing both, and about 4 % more 5 or 7.
+Such a point is never written (its (a,b) is not coprime), so gpusieve writes no bucket entries there, and in the even
+rows sieves only the odd columns (`-skip 3`, the idea of cuda-sieve's `--sieve-skip`). On a T4, with the same output:
+
+| side | `-I` | `-lim` | `-skip 0` | `-skip 3` |
+|---|---|---|---|---|
+| x - 10^53 | 16 | `2^28` | 320 ms per q | 228 ms (-29 %) |
+| x^7 - 30 | 15 | `2^27` | 73 ms | 51 ms (-30 %) |
+| x^7 - 30 | 17 | `2^27` | 1209 ms | 833 ms (-31 %) |
+
+## Large values
+
+The sieve adds the logs of a point's primes into one byte, so a sum of 256 or more would wrap (and carry into the next
+point). A point's sum is at most about log2 of its value, so when the largest value |F(a,b)/q| of the region reaches
+`2^245` (a high degree, a large `-I` or large coefficients; not the stores above, whose values stay below `2^220`),
+gpusieve scales all logs and thresholds by 245 / log2 of that value, as las does, and says so at startup. On
+x - 10^80 at `-I 16` (values up to `2^268`), that found 1072 smooth pairs in 2100 special-q against 814 unscaled (a different 223 of them only unscaled: the scaled logs round more coarsely).
+
+## Host memory
+
+The large primes of the factor base are built a batch at a time on the host and copied to the GPU before the next batch,
+so the host needs about 250 MB at lim `2^32` (it took 4.3 GB at startup, and 1 GB while sieving, before). Besides that
+come the output buffer (8 bytes per `-maxout` survivor, 128 MB by default) and absort's and NFS_factory's own needs.
 
 ## Compact output
 
