@@ -280,12 +280,13 @@ The sieve adds the logs of a point's primes into one byte, so a sum of 256 or mo
 point). A point's sum is at most about log2 of its value, so when the largest value |F(a,b)/q| of the region reaches
 `2^245` (a high degree, a large `-I` or large coefficients; not the stores above, whose values stay below `2^220`),
 gpusieve scales all logs and thresholds by 245 / log2 of that value, as las does, and says so at startup. On
-x - 10^80 at `-I 16` (values up to `2^268`), that found 1072 smooth pairs in 2100 special-q against 814 unscaled (a different 223 of them only unscaled: the scaled logs round more coarsely).
+x - 10^80 at `-I 16` (values up to `2^268`), that found 1072 smooth pairs in 2100 special-q against 814 unscaled (223 of them only unscaled and 481 only scaled: at the new scale the logs round differently, which moves points
+near the threshold across it in both directions).
 
 ## Host memory
 
-The large primes of the factor base are built a batch at a time on the host and copied to the GPU before the next batch,
-so the host needs about 250 MB at lim `2^32` (it took 4.3 GB at startup, and 1 GB while sieving, before). Besides that
+The large primes of the factor base are built a batch at a time on the host and copied to the GPU while the next is built,
+so the host needs about 280 MB at lim `2^32` (it took 4.3 GB at startup, and 1 GB while sieving, before). Besides that
 come the output buffer (8 bytes per `-maxout` survivor, 128 MB by default) and absort's and NFS_factory's own needs.
 
 ## Compact output

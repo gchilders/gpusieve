@@ -402,6 +402,27 @@ static bool reduce_q_fits(uint64_t qmax, double skew)
 
 // CADO generic_skew_gauss (quadratic form a^2 + s^2 b^2 with s^2 = mz * 2^ex) followed by sieve_info_adjust_IJ (strategy 0).
 
+// log2 of the largest |F(a,b)/q| of the special-q side (the sieved one) over |i| <= I/2, 0 <= j < L.J of the lattice L
+// (at least 0): the log sums of the sieve bytes stay near it (see lscale)
+static double sq_lmax(const QLattice& L, int logI)
+{
+	const double Id = (double)(1u << logI), qd = (double)L.q;
+	for (const Side& S : g_sides) {
+		if (!S.sq) continue;
+		double v;
+		if (S.c.size() == 2) {
+			const double alpha = (S.c[1] * (double)L.a0 + S.c[0] * (double)L.b0) / qd, beta = (S.c[1] * (double)L.a1 + S.c[0] * (double)L.b1) / qd;
+			v = fabs(alpha) * Id / 2 + fabs(beta) * L.J;
+		} else {
+			std::vector<double> fij = homography<double>(S.c, (double)L.a0, (double)L.b0, (double)L.a1, (double)L.b1);
+			for (double& x : fij) x /= qd;
+			v = RectNorm(fij)(Id / 2, (double)L.J);
+		}
+		return log2(std::max(v, 1.0));
+	}
+	return 0;
+}
+
 static QLattice reduce_q(uint64_t q, uint64_t r, double skew, int logI)
 {
 	int ex; double mant = frexp(skew * skew, &ex);
@@ -444,7 +465,6 @@ static QLattice reduce_q(uint64_t q, uint64_t r, double skew, int logI)
 	const double fudge = 2.0, Id = (double)(1u << logI), qd = (double)q;
 	const double Aw = Id * sqrt(qd * skew), Bw = (double)(1u << (logI - 1)) * sqrt(qd / skew);
 	double Jmax = (double)(1u << (logI - 1));
-	std::function<double(double)> vsq;               // the sieved side's largest |value/q| for a J
 	for (const Side& S : g_sides) {
 		double X = fudge * Aw / 2, Y = fudge * Bw;
 		std::function<double(double)> v;
@@ -462,7 +482,6 @@ static QLattice reduce_q(uint64_t q, uint64_t r, double skew, int logI)
 			RectNorm R(fij);
 			v = [=](double J) { return R(Id / 2, J); };
 		}
-		if (S.sq) vsq = v;
 		if (v(Jmax) > maxnorm) {
 			double a = 0, b = Jmax;
 			while (trunc(a) != trunc(b)) { double c = (a + b) * 0.5; if (v(c) < maxnorm) a = c; else b = c; }
@@ -473,7 +492,7 @@ static QLattice reduce_q(uint64_t q, uint64_t r, double skew, int logI)
 	uint32_t lines = 1u << std::max(16 - logI, 0);       // LOG_BUCKET_REGION = 16: round down to whole bucket regions
 	J = (J / lines) * lines;
 	L.J = J;
-	if (vsq) L.lmax = log2(std::max(vsq((double)J), 1.0));
+	L.lmax = sq_lmax(L, logI);
 	return L;
 }
 
@@ -604,11 +623,12 @@ __global__ void k_transform(DevFB fb, uint64_t q, int64_t a0, int64_t b0, int64_
 	fb.R[k] = (uint32_t)((uint64_t)(B ? p - B : 0) * inv % p);
 }
 
-// -lim with values near 2^255 (see lscale): the large entries' logs, scaled (a large entry's base is its modulus)
-__global__ void k_scale_logp(const uint32_t* p, uint8_t* logp, int k0, int n, double s)
+// the entries' logs, round(s * log2 of the prime): s = lscale, 1 unless the values come near 2^255 (a small entry's prime
+// is its base; a large entry is a prime)
+__global__ void k_logp(const uint32_t* base, const uint32_t* p, uint8_t* logp, int nsmall, int n, double s)
 {
-	const int k = k0 + blockIdx.x * blockDim.x + threadIdx.x;
-	if (k < n) logp[k] = (uint8_t)llround(s * log2((double)p[k]));
+	const int k = blockIdx.x * blockDim.x + threadIdx.x;
+	if (k < n) logp[k] = (uint8_t)llround(s * log2((double)(k < nsmall ? base[k] : p[k])));
 }
 
 // Franke-Kleinjung: reduce the lattice {(i,j): i = j*R mod p} for width I to warp (-mi0,j0), step (i1,j1).
@@ -1079,21 +1099,20 @@ int main(int argc, char** argv)
 
 	// factor base: primes up to lim; prime powers below I for the small primes. The large entries (p >= I, nearly all of
 	// them: 203M at lim 2^32) are built in chunks of the range by a segmented sieve, a batch of chunks at a time on the
-	// host threads, and each batch is copied to the GPU before the next is built. So the host holds only a batch (under
-	// 100 MB) instead of the whole factor base: building it whole (12 bytes per entry, its chunks and their concatenation
+	// host threads, and each batch is copied to the GPU while the next is built. So the host holds only two batches
+	// (under 100 MB) instead of the whole factor base: building it whole (12 bytes per entry, its chunks and their concatenation
 	// at once, then a 4-byte copy of the moduli kept for the run) took 4.5 GB at lim 2^32 and kept 1 GB.
 	if (lim >= (1ull << 32)) { fprintf(stderr, "lim must be below 2^32\n"); return 1; }
 	const std::vector<uint32_t> sieve_primes = base_primes((uint32_t)sqrtl((long double)lim) + 2);
-	struct E { uint32_t p, base, y0, y1; uint8_t lg; };
+	struct E { uint32_t p, base, y0, y1; };          // (logs: k_logp, once the scale is known)
 	std::vector<E> small;
-	auto lgp = [](uint64_t p) { return (uint8_t)lround(log2((double)p)); };
 	{
 		std::vector<uint32_t> sp;                        // primes below I (and up to lim)
 		seg_primes(2, std::min<uint64_t>(I, lim + 1), sieve_primes, sp);
 		if (!poly_norm) {       // linear: (y1, y0) = (c1, c0) mod p^k
 			for (uint32_t p : sp)
 				for (uint64_t pk = p; pk < I; pk *= p)
-					small.push_back({(uint32_t)pk, p, (uint32_t)mod_str(g_spoly[0], pk), (uint32_t)mod_str(g_spoly[1], pk), lgp(p)});
+					small.push_back({(uint32_t)pk, p, (uint32_t)mod_str(g_spoly[0], pk), (uint32_t)mod_str(g_spoly[1], pk)});
 		} else {                // degree >= 2: one entry per root, (y1, y0) = (1, -r) or (-s, 1) mod p^k
 			uint64_t f[MAXD + 1], rv[MAXD + 1];
 			std::vector<uint64_t> roots, s;
@@ -1103,12 +1122,12 @@ int main(int argc, char** argv)
 				const bool proj = f[sdeg] == 0;
 				for (uint64_t m = p; m < I && !roots.empty(); m *= p) {      // affine roots mod p^k, lifted from those mod p^(k-1)
 					if (m > p) { spoly_mod(m, f); roots = lift_roots(f, sdeg, m, p, roots); }
-					for (uint64_t r : roots) small.push_back({(uint32_t)m, p, (uint32_t)((m - r) % m), 1, lgp(p)});
+					for (uint64_t r : roots) small.push_back({(uint32_t)m, p, (uint32_t)((m - r) % m), 1});
 				}
 				s.assign(proj ? 1 : 0, 0);                                    // projective: roots s = 0 mod p of the reversed polynomial
 				for (uint64_t m = p; m < I && !s.empty(); m *= p) {
 					if (m > p) { spoly_mod(m, f); for (int k = 0; k <= sdeg; k++) rv[k] = f[sdeg - k]; s = lift_roots(rv, sdeg, m, p, s); }
-					for (uint64_t x : s) small.push_back({(uint32_t)m, p, 1, (uint32_t)((m - x) % m), lgp(p)});
+					for (uint64_t x : s) small.push_back({(uint32_t)m, p, 1, (uint32_t)((m - x) % m)});
 				}
 			}
 		}
@@ -1141,54 +1160,59 @@ int main(int argc, char** argv)
 		dumpf = fopen(dumpfb, "w"); if (!dumpf) { perror(dumpfb); return 1; }
 		for (const E& e : small) fprintf(dumpf, "%u %u %u %u\n", e.p, e.base, e.y1, e.y0);
 	}
-	DevFB fb; fb.n = (int)(nsmall + lcap); fb.nsmall = nsmall; fb.proj = fb.nproj = fb.npart = nullptr; fb.part = nullptr;
+	DevFB fb; fb.n = 0; fb.nsmall = nsmall; fb.proj = fb.nproj = fb.npart = nullptr; fb.part = nullptr;   // (fb.n: below, when known)
 	// GPU memory that does not shrink with more passes: the factor base (p, y0, y1, logp: 13 bytes per entry; base and the
 	// Barrett constant of the small entries: 8 more each), each lane's R (and the small entries' projective/partial lists)
 	// and the two survivor buffers. A GPU without room for it in all can never run this; then fail instead of retrying (an
 	// allocation that fails later, with the room there in all, means other programs hold the memory: a temporary exit).
-	// (fb.n is the estimate here, set to the true count below.)
-	if (!dumpf) {
-		const double fixed_bytes = 13.0 * fb.n + 8.0 * nsmall + lanes * (4.0 * fb.n + 20.0 * nsmall) + 16.0 * std::min<double>(maxout_m * 1048576.0, 4e9);
+	// Checked for the estimate before the factor base is built and again whenever its arrays grow.
+	auto check_fits = [&](size_t nent) {
+		const double fixed_bytes = 13.0 * nent + 8.0 * nsmall + lanes * (4.0 * nent + 20.0 * nsmall) + 16.0 * std::min<double>(maxout_m * 1048576.0, 4e9);
 		if (fixed_bytes > 0.9 * (double)gpu_total) {
 			fprintf(stderr, "the GPU has %.2f GB; the factor base and survivor buffers alone need %.2f GB (lower -lim or -maxout)\n",
 				gpu_total / 1e9, fixed_bytes / 1e9);
 			gs_boinc_finish(1);
 		}
-	}
+	};
+	if (!dumpf) check_fits(nsmall + lcap);
 	fb.ktiny = (int)(std::find_if(small.begin(), small.end(), [&](const E& e) { return e.p >= tiny; }) - small.begin());
 	med = std::max(med, tiny);
 	fb.kmed = (int)(std::find_if(small.begin(), small.end(), [&](const E& e) { return e.p >= med; }) - small.begin());
-	// (base only for the small entries: a large entry is a prime, its own base. R: each lane allocates its own below.)
-	size_t fbcap = dumpf ? 0 : (size_t)fb.n;
+	// (base only for the small entries: a large entry is a prime, its own base. R: each lane allocates its own below.
+	// logp: computed on the GPU by k_logp once the special-q, and with them the scale of the logs, are known.)
+	size_t fbcap = dumpf ? 0 : nsmall + lcap;        // entries the GPU arrays hold
 	fb.R = nullptr; fb.p = fb.y0 = fb.y1 = fb.base = fb.minv = nullptr; fb.logp = nullptr;
 	if (!dumpf) {
 		CHECK(cudaMalloc(&fb.p, fbcap * 4)); CHECK(cudaMalloc(&fb.base, (size_t)std::max(nsmall, 1) * 4)); CHECK(cudaMalloc(&fb.y0, fbcap * 4));
 		CHECK(cudaMalloc(&fb.y1, fbcap * 4)); CHECK(cudaMalloc(&fb.logp, fbcap));
-		std::vector<uint32_t> a(nsmall), b(nsmall), c(nsmall), d(nsmall); std::vector<uint8_t> l(nsmall);
-		for (int t = 0; t < nsmall; t++) { a[t] = small[t].p; b[t] = small[t].base; c[t] = small[t].y0; d[t] = small[t].y1; l[t] = small[t].lg; }
+		std::vector<uint32_t> a(nsmall), b(nsmall), c(nsmall), d(nsmall);
+		for (int t = 0; t < nsmall; t++) { a[t] = small[t].p; b[t] = small[t].base; c[t] = small[t].y0; d[t] = small[t].y1; }
 		CHECK(cudaMemcpy(fb.p, a.data(), (size_t)nsmall * 4, cudaMemcpyHostToDevice));
 		CHECK(cudaMemcpy(fb.base, b.data(), (size_t)nsmall * 4, cudaMemcpyHostToDevice));
 		CHECK(cudaMemcpy(fb.y0, c.data(), (size_t)nsmall * 4, cudaMemcpyHostToDevice));
 		CHECK(cudaMemcpy(fb.y1, d.data(), (size_t)nsmall * 4, cudaMemcpyHostToDevice));
-		CHECK(cudaMemcpy(fb.logp, l.data(), (size_t)nsmall, cudaMemcpyHostToDevice));
 		std::vector<uint32_t> mv(std::max(nsmall, 1));      // Barrett constants (mod_b) of the small entries
 		for (int t = 0; t < nsmall; t++) mv[t] = 0xffffffffu / small[t].p;
 		CHECK(cudaMalloc(&fb.minv, mv.size() * 4)); CHECK(cudaMemcpy(fb.minv, mv.data(), mv.size() * 4, cudaMemcpyHostToDevice));
 	}
-	// the large entries, a batch of chunks at a time. Besides the entries, each chunk counts those below line_lim (the
-	// entries are sorted, so these give nline) and sums 1/p of those at or above it (the bucket-sieved ones: the
-	// expected bucket fill). -twopass keeps the moduli on the host for its chunking.
+	// the large entries, a batch of chunks at a time: while the host threads build one batch, the main thread copies the
+	// previous one to the GPU. Besides the entries, each chunk counts those below line_lim (the entries are sorted, so
+	// these give nline) and sums 1/p of those at or above it (the bucket-sieved ones: the expected bucket fill). -twopass
+	// keeps the moduli on the host for its chunking.
 	size_t nlg = 0;
-	int nbelow_line = 0;
+	int nline = 0;
 	double inv_sum = 0;
 	std::vector<uint32_t> fp_tp;                     // -twopass: the large moduli
+	if (!oldbuckets) fp_tp.reserve(lcap);
 	if (llo < lhi) {
-		const size_t nchunk = 4096, batch = std::max<size_t>(64, 8 * (size_t)nthreads);
-		struct Chunk { std::vector<uint32_t> p, y0, y1; std::vector<uint8_t> lg; int nl = 0; double inv = 0; };
-		std::vector<Chunk> part(batch);
-		// grow the GPU arrays to hold at least `need` entries (copies on the GPU; rare: only if the estimate was low)
+		const size_t nchunk = 4096, batch = std::max<size_t>(32, 4 * (size_t)nthreads);
+		struct Chunk { std::vector<uint32_t> p, y0, y1; int nl = 0; double inv = 0; };
+		std::vector<Chunk> part[2] = {std::vector<Chunk>(batch), std::vector<Chunk>(batch)};
+		// grow the GPU arrays to hold at least `need` entries (copies on the GPU, one array at a time; rare: only if the
+		// estimate was low)
 		auto grow = [&](size_t need) {
-			size_t nc = std::max(need, fbcap + fbcap / 8);
+			const size_t nc = std::max(need, fbcap + fbcap / 8);
+			check_fits(nc);
 			auto re = [&](auto*& ptr, size_t elem) {
 				void* np = nullptr; CHECK(cudaMalloc(&np, nc * elem));
 				CHECK(cudaMemcpy(np, ptr, (nsmall + nlg) * elem, cudaMemcpyDeviceToDevice));
@@ -1198,13 +1222,12 @@ int main(int argc, char** argv)
 			fprintf(stderr, "factor base: more entries than estimated, GPU arrays grown from %zu to %zu\n", fbcap, nc);
 			fbcap = nc;
 		};
-		for (size_t c0 = 0; c0 < nchunk; c0 += batch) {
-			const size_t nb = std::min(batch, nchunk - c0);
-			parallel_for(nb, nthreads, [&](size_t t) {
+		auto build = [&](size_t c0, std::vector<Chunk>& P) {       // the chunks c0 .. c0 + batch - 1 into P
+			parallel_for(std::min(batch, nchunk - c0), nthreads, [&](size_t t) {
 				const size_t c = c0 + t;
 				std::vector<uint32_t> ps;
 				seg_primes(llo + (lhi - llo) * c / nchunk, llo + (lhi - llo) * (c + 1) / nchunk, sieve_primes, ps);
-				Chunk& C = part[t];
+				Chunk& C = P[t];
 				C.p.clear(); C.y0.clear(); C.y1.clear();
 				if (!poly_norm) {
 					C.p = ps; C.y0.resize(ps.size()); C.y1.resize(ps.size());
@@ -1218,15 +1241,13 @@ int main(int argc, char** argv)
 						if (f[sdeg] == 0) { C.p.push_back(p); C.y0.push_back(1); C.y1.push_back(0); }   // projective: (-s, 1), s = 0
 					}
 				}
-				C.lg.resize(C.p.size()); C.nl = 0; C.inv = 0;
-				for (size_t u = 0; u < C.p.size(); u++) {
-					const uint32_t p = C.p[u];
-					C.lg[u] = lgp(p);
-					if (p < line_lim) C.nl++; else C.inv += 1.0 / p;
-				}
+				C.nl = 0; C.inv = 0;
+				for (uint32_t p : C.p) { if (p < line_lim) C.nl++; else C.inv += 1.0 / p; }
 			}, 1);     // one chunk at a time: a batch has only a few per thread
-			for (size_t t = 0; t < nb; t++) {
-				Chunk& C = part[t];
+		};
+		auto take = [&](size_t c0, std::vector<Chunk>& P) {        // the built chunks to the GPU (or the dump file), in order
+			for (size_t t = 0; t < std::min(batch, nchunk - c0); t++) {
+				Chunk& C = P[t];
 				const size_t m = C.p.size();
 				if (dumpf) for (size_t u = 0; u < m; u++) fprintf(dumpf, "%u %u %u %u\n", C.p[u], C.p[u], C.y1[u], C.y0[u]);
 				else if (m) {
@@ -1235,11 +1256,17 @@ int main(int argc, char** argv)
 					CHECK(cudaMemcpy(fb.p + at, C.p.data(), m * 4, cudaMemcpyHostToDevice));
 					CHECK(cudaMemcpy(fb.y0 + at, C.y0.data(), m * 4, cudaMemcpyHostToDevice));
 					CHECK(cudaMemcpy(fb.y1 + at, C.y1.data(), m * 4, cudaMemcpyHostToDevice));
-					CHECK(cudaMemcpy(fb.logp + at, C.lg.data(), m, cudaMemcpyHostToDevice));
 				}
 				if (!oldbuckets) fp_tp.insert(fp_tp.end(), C.p.begin(), C.p.end());
-				nlg += m; nbelow_line += C.nl; inv_sum += C.inv;
+				nlg += m; nline += C.nl; inv_sum += C.inv;
 			}
+		};
+		build(0, part[0]);
+		for (size_t c0 = 0, b = 0; c0 < nchunk; c0 += batch, b ^= 1) {
+			std::thread next;
+			if (c0 + batch < nchunk) next = std::thread(build, c0 + batch, std::ref(part[b ^ 1]));
+			take(c0, part[b]);
+			if (next.joinable()) next.join();
 		}
 	}
 	if ((size_t)nsmall + nlg >= (1ull << 31)) { fprintf(stderr, "factor base too large (%zu entries)\n", nsmall + nlg); return 1; }
@@ -1250,8 +1277,9 @@ int main(int argc, char** argv)
 		return 0;
 	}
 	fb.n = (int)(nsmall + nlg);
-	fb.nline = line_lim ? nbelow_line : 0;
-	const double fb_bytes = 13.0 * fb.n + 8.0 * nsmall, lane_fb_bytes = 4.0 * fb.n + 20.0 * nsmall;
+	fb.nline = nline;                                // (0 when line_lim is: no entry is below it)
+	// (the arrays hold fbcap entries, up to 1 % more than fb.n, or 1/8 more after growing; R only fb.n)
+	const double fb_bytes = 13.0 * fbcap + 8.0 * nsmall, lane_fb_bytes = 4.0 * fb.n + 20.0 * nsmall;
 	fprintf(stderr, "factor base: %d entries (%d below I = %u), set up in %.1f s\n", fb.n, nsmall, I,
 		std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
 
@@ -1275,7 +1303,7 @@ int main(int argc, char** argv)
 				}
 				qs.push_back({q, r, a0, b0, a1, b1, J});
 				QLattice M = reduce_q(q, poly_norm ? r : lin_root(q), P.skew, logI);   // compare with our own reduction
-				qs.back().lmax = M.lmax;
+				qs.back().lmax = sq_lmax(qs.back(), logI);       // with las' basis and J, which are the ones sieved
 				bool same = M.r == r && M.J == J && ((M.a0 == a0 && M.b0 == b0) || (M.a0 == -a0 && M.b0 == -b0))
 				            && ((M.a1 == a1 && M.b1 == b1) || (M.a1 == -a1 && M.b1 == -b1));
 				if (!same) { nbasis_diff++; if (verbose) fprintf(stderr, "q=%llu: las basis (%lld,%lld) (%lld,%lld) J=%u, ours (%lld,%lld) (%lld,%lld) J=%u\n",
@@ -1326,19 +1354,16 @@ int main(int argc, char** argv)
 	fprintf(stderr, "%zu special-q\n", qs.size());
 	// The sieve adds logs into bytes with 32-bit atomics (add_log): a sum above 255 would wrap and carry into the next
 	// point. A point's sum is about log2|F/q| at most (rounded logs, prime powers), so if the largest |F/q| of the region
-	// comes near 2^255, all logs and thresholds are scaled by lscale (as las' scale): 245 / its log2.
+	// comes near 2^255, all logs and thresholds are scaled by lscale (as las' scale): 245 / its log2. Then the logs.
 	double lscale = 1;
 	{
 		double ml = 0; for (const QLattice& Q : qs) ml = std::max(ml, Q.lmax);
 		if (ml > 245 && !noscale) {
 			lscale = 245 / ml;
-			std::vector<uint8_t> l(nsmall);
-			for (int t = 0; t < nsmall; t++) l[t] = (uint8_t)lround(lscale * log2((double)small[t].base));
-			CHECK(cudaMemcpy(fb.logp, l.data(), nsmall, cudaMemcpyHostToDevice));
-			if (fb.n > nsmall) k_scale_logp<<<(fb.n - nsmall + 255) / 256, 256>>>(fb.p, fb.logp, nsmall, fb.n, lscale);
-			CHECK(cudaDeviceSynchronize());
 			fprintf(stderr, "values up to 2^%.1f: logs scaled by %.4f so that the sieve sums stay below 256\n", ml, lscale);
 		}
+		k_logp<<<(fb.n + 255) / 256, 256>>>(fb.base, fb.p, fb.logp, nsmall, fb.n, lscale);
+		CHECK(cudaGetLastError()); CHECK(cudaDeviceSynchronize());
 	}
 
 	// chunks of large primes with equal expected hits (about I*J/p each), for k_buckets2
@@ -1613,6 +1638,7 @@ int main(int argc, char** argv)
 		const double pv[] = {(double)side, (double)logI, (double)logIin, (double)lim, (double)mfb, slack, (double)q0, (double)q1, (double)nrandom,
 		                     dummy_bits, (double)maxout, (double)tiny, (double)qs.size(), (double)compact};
 		mix(pv, sizeof pv);
+		if (lscale != 1) mix(&lscale, sizeof lscale);    // (so unscaled runs keep the checkpoints of earlier versions)
 	}
 	size_t k0 = 0;
 	if (ckptf && resume) {
